@@ -27,7 +27,9 @@ from perturbation_encoder import PerturbationEncoder, PerturbationEncoderInferen
 from transformers import AutoFeatureExtractor
 
 import accelerate
-import datasets
+import anndata as ad
+from torch.utils.data import Dataset
+from PIL import Image
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -37,7 +39,6 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
-from datasets import load_dataset
 from huggingface_hub import create_repo
 from packaging import version
 from torchvision import transforms
@@ -66,7 +67,8 @@ check_min_version("0.26.0.dev0")
 logger = get_logger(__name__, log_level="INFO")
 
 DATASET_NAME_MAPPING = {
-    "lambdalabs/pokemon-blip-captions": ("image", "text"),
+    # Removed default mapping as we are not using datasets hub anymore
+    # "lambdalabs/pokemon-blip-captions": ("image", "text"),
 }
 
 
@@ -244,14 +246,28 @@ def parse_args():
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
     parser.add_argument(
-        "--dataset_name",
+        "--train_data_path",
         type=str,
-        default=None,
-        help=(
-            "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
-            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
-            " or to a folder containing files that ?? Datasets can understand."
-        ),
+        required=True,
+        help="Path to the training h5ad file.",
+    )
+    parser.add_argument(
+        "--image_path_column",
+        type=str,
+        default="image_path",
+        help="Column name in h5ad obs containing the relative image path.",
+    )
+    parser.add_argument(
+        "--perturb_id_column",
+        type=str,
+        default="perturb_id",
+        help="Column name in h5ad obs containing the perturbation identifier.",
+    )
+    parser.add_argument(
+        "--image_root_dir",
+        type=str,
+        default="",
+        help="Root directory for images if paths in h5ad are relative to this directory.",
     )
     parser.add_argument(
         "--dataset_id",
@@ -264,28 +280,6 @@ def parse_args():
         type=str,
         default=None,
         help="The config of the Dataset, leave as None if there's only one config.",
-    )
-    parser.add_argument(
-        "--train_data_dir",
-        type=str,
-        default="datasets/BBBC021/",
-        help=(
-            "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
-        ),
-    )
-    parser.add_argument(
-        "--image_column",
-        type=str,
-        default="image",
-        help="The column of the dataset containing an image."
-    )
-    parser.add_argument(
-        "--caption_column",
-        type=str,
-        default="additional_feature",
-        help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
         "--max_train_samples",
@@ -509,7 +503,7 @@ def parse_args():
     parser.add_argument(
         "--tracker_project_name",
         type=str,
-        default="text2image-fine-tune",
+        default=None,
         help=(
             "The `project_name` argument passed to Accelerator.init_trackers for"
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
@@ -562,15 +556,31 @@ def parse_args():
         args.local_rank = env_local_rank
 
     # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
+    if not args.train_data_path:
+        raise ValueError("Need --train_data_path argument specifying the h5ad file.")
+    if not os.path.exists(args.train_data_path):
+        raise FileNotFoundError(f"Training data file not found: {args.train_data_path}")
 
     # default to using the same revision for the non-ema model if not specified
     if args.non_ema_revision is None:
         args.non_ema_revision = args.revision
 
-    if args.report_to == 'wandb':
-        args.tracker_project_name = args.output_dir.split('/')[-1] 
+    if args.report_to == 'wandb' and args.hub_token is not None:
+        raise ValueError(
+            "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
+            " Please use `huggingface-cli login` to authenticate with the Hub."
+        )
+
+    if args.non_ema_revision is not None:
+        deprecate(
+            "non_ema_revision!=None",
+            "0.15.0",
+            message=(
+                "Downloading 'non_ema' weights from revision branches of the Hub is deprecated. Please make sure to"
+                " use `--variant=non_ema` instead."
+            ),
+        )
+
     args.validation_prompts = args.validation_prompts[0].split(',')
     args.trained_steps = int(args.trained_steps)
 
@@ -593,6 +603,69 @@ def encode_prompt(identifier):
     return prompt_embeds
 
 
+# +++ Added H5adDataset +++
+class H5adDataset(Dataset):
+    def __init__(self, adata_path, image_path_column, perturb_id_column, transform=None, image_root_dir=""):
+        """
+        Args:
+            adata_path (str): Path to the h5ad file.
+            image_path_column (str): Column name in adata.obs for image paths.
+            perturb_id_column (str): Column name in adata.obs for perturbation IDs.
+            transform (callable, optional): Optional transform to be applied on a sample's image.
+            image_root_dir (str, optional): Root directory to prepend to relative image paths. Defaults to "".
+        """
+        self.adata_path = adata_path
+        try:
+            self.adata = ad.read_h5ad(adata_path)
+            logger.info(f"Successfully loaded AnnData from {adata_path} with {len(self.adata)} observations.")
+        except Exception as e:
+            logger.error(f"Failed to load AnnData file {adata_path}: {e}")
+            raise # Reraise the exception to stop execution if file loading fails
+
+        self.image_path_column = image_path_column
+        self.perturb_id_column = perturb_id_column
+        self.transform = transform
+        self.image_root_dir = image_root_dir
+
+        # Validate column existence
+        if self.image_path_column not in self.adata.obs.columns:
+            raise ValueError(f"Image path column '{self.image_path_column}' not found in AnnData obs.")
+        if self.perturb_id_column not in self.adata.obs.columns:
+             raise ValueError(f"Perturbation ID column '{self.perturb_id_column}' not found in AnnData obs.")
+
+    def __len__(self):
+        return len(self.adata)
+
+    def __getitem__(self, idx):
+        if idx >= len(self.adata):
+             raise IndexError("Index out of bounds")
+             
+        image_rel_path = self.adata.obs[self.image_path_column].iloc[idx]
+        # Construct full path if image_root_dir is provided
+        image_path = os.path.join(self.image_root_dir, image_rel_path) if self.image_root_dir else image_rel_path
+        
+        try:
+            # Ensure path separators are correct for the OS
+            image_path = os.path.normpath(image_path)
+            image = Image.open(image_path).convert("RGB")
+        except FileNotFoundError:
+            logger.warning(f"Image file not found at {image_path}. Skipping sample index {idx}.")
+            return None # Signal to collate_fn to skip this sample
+        except Exception as e:
+            logger.warning(f"Error loading image {image_path}: {e}. Skipping sample index {idx}.")
+            return None # Signal to collate_fn to skip this sample
+
+        perturb_id = str(self.adata.obs[self.perturb_id_column].iloc[idx]) # Ensure it's a string
+
+        sample = {"image": image, "perturb_id": perturb_id}
+
+        if self.transform:
+            sample["image"] = self.transform(sample["image"]) # Now image is a tensor
+
+        return sample
+# --- End Added H5adDataset ---
+
+
 def main():
     args = parse_args()
 
@@ -601,22 +674,6 @@ def main():
 
     global naive_conditional
     naive_conditional = args.naive_conditional
-
-    if args.report_to == "wandb" and args.hub_token is not None:
-        raise ValueError(
-            "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
-            " Please use `huggingface-cli login` to authenticate with the Hub."
-        )
-
-    if args.non_ema_revision is not None:
-        deprecate(
-            "non_ema_revision!=None",
-            "0.15.0",
-            message=(
-                "Downloading 'non_ema' weights from revision branches of the Hub is deprecated. Please make sure to"
-                " use `--variant=non_ema` instead."
-            ),
-        )
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir,
                                                       logging_dir=args.logging_dir)
@@ -636,11 +693,9 @@ def main():
     )
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
     else:
-        datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
@@ -702,17 +757,26 @@ def main():
 
     # Create EMA for the unet.
     if args.use_ema:
-        if args.pretrained_model_name_or_path == args.pretrained_vae_path:
+        ema_model_path = args.pretrained_model_name_or_path
+        ema_subfolder = "unet" if args.pretrained_model_name_or_path == args.pretrained_vae_path else "unet_ema"
+        try:
             ema_unet = UNet2DConditionModel.from_pretrained(
-                args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+                ema_model_path, subfolder=ema_subfolder, revision=args.revision, variant=args.variant
             )
-        else:
-            ema_unet = UNet2DConditionModel.from_pretrained(
-                args.pretrained_model_name_or_path, subfolder="unet_ema", revision=args.revision, variant=args.variant
-            )
-        ema_unet = EMAModel(ema_unet.parameters(),
-                            model_cls=UNet2DConditionModel,
-                            model_config=ema_unet.config)
+            ema_unet = EMAModel(
+                 # Pass the parameters of the *trainable* unet model to EMA
+                 ema_unet.parameters(), 
+                 model_cls=UNet2DConditionModel, 
+                 model_config=ema_unet.config
+                 )
+            logger.info("EMA model created successfully.")
+        except Exception as e:
+             logger.error(f"Failed to create EMA model from {ema_model_path}/{ema_subfolder}: {e}")
+             args.use_ema = False # Disable EMA if creation fails
+             ema_unet = None
+             logger.warning("EMA disabled due to error during initialization.")
+    else:
+         ema_unet = None # Explicitly set to None if not using EMA
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -732,7 +796,7 @@ def main():
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
-                if args.use_ema:
+                if args.use_ema and ema_unet is not None:
                     ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
 
                 for i, model in enumerate(models):
@@ -742,7 +806,7 @@ def main():
                     weights.pop()
 
         def load_model_hook(models, input_dir):
-            if args.use_ema:
+            if args.use_ema and ema_unet is not None:
                 load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
                 ema_unet.load_state_dict(load_model.state_dict())
                 ema_unet.to(accelerator.device)
@@ -789,7 +853,7 @@ def main():
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        unet.parameters(),
+        filter(lambda p: p.requires_grad, unet.parameters()), # Ensure optimizer only optimizes trainable parameters
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -801,80 +865,140 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            data_dir=args.train_data_dir,
-        )
-    else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
+    # --- Removed old dataset loading logic ---
+    # if args.dataset_name is not None:
+    #     # Downloading and loading a dataset from the hub.
+    #     dataset = load_dataset(
+    #         args.dataset_name,
+    #         args.dataset_config_name,
+    #         cache_dir=args.cache_dir,
+    #         data_dir=args.train_data_dir,
+    #     )
+    # else:
+    #     data_files = {}
+    #     if args.train_data_dir is not None:
+    #         data_files["train"] = os.path.join(args.train_data_dir, "**")
+    #     dataset = load_dataset(
+    #         "imagefolder",
+    #         data_files=data_files,
+    #         cache_dir=args.cache_dir,
+    #     )
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
     # Preprocessing the datasets.
-    column_names = dataset["train"].column_names
+    # column_names = dataset["train"].column_names # Removed
 
     # 6. Get the column names for input/target.
-    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
-            )
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-            )
+    # dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None) # Removed
+    # if args.image_column is None:
+    #     image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
+    # else:
+    #     image_column = args.image_column
+    #     if image_column not in column_names:
+    #         raise ValueError(
+    #             f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
+    #         )
+    # if args.caption_column is None:
+    #     caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
+    # else:
+    #     caption_column = args.caption_column
+    #     if caption_column not in column_names:
+    #         raise ValueError(
+    #             f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
+    #         ) # --- End Removed old dataset loading logic ---
 
+    # Define image transformations
     train_transforms = transforms.Compose(
         [
             transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])])
+            transforms.Normalize([0.5], [0.5])]) # Assuming single channel normalization? If RGB, use [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
 
-    def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
-        return examples
+    # def preprocess_train(examples): # Removed
+    #     images = [image.convert("RGB") for image in examples[image_column]]
+    #     examples["pixel_values"] = [train_transforms(image) for image in images]
+    #     return examples
 
+    # Create the H5adDataset
     with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(
-                seed=args.seed).select(range(args.max_train_samples))
+        try:
+            train_dataset = H5adDataset(
+                adata_path=args.train_data_path,
+                image_path_column=args.image_path_column,
+                perturb_id_column=args.perturb_id_column,
+                transform=train_transforms,
+                image_root_dir=args.image_root_dir
+            )
+            logger.info(f"Successfully created H5adDataset with {len(train_dataset)} samples.")
+        except (ValueError, FileNotFoundError) as e:
+             logger.error(f"Error creating H5adDataset: {e}")
+             # Exit if dataset creation fails crucially
+             exit(1) 
+        # Removed max_train_samples logic as it's easier to handle by slicing the h5ad file beforehand if needed.
+        # if args.max_train_samples is not None:
+        #     dataset["train"] = dataset["train"].shuffle(
+        #         seed=args.seed).select(range(args.max_train_samples))
         # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
+        # train_dataset = dataset["train"].with_transform(preprocess_train) # Removed
 
+
+    # +++ Updated collate_fn +++
     def collate_fn(examples):
+        # Filter out None samples caused by loading errors in __getitem__
+        original_count = len(examples)
+        examples = [e for e in examples if e is not None]
+        filtered_count = len(examples)
+        
+        if original_count != filtered_count:
+             logger.warning(f"Filtered out {original_count - filtered_count} samples due to loading errors in this batch.")
 
-        pixel_values = torch.stack(
-            [example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(
-            memory_format=torch.contiguous_format).float()
+        if not examples:
+            # Return an empty dictionary or None if the whole batch failed
+            # Returning None might be simpler for the training loop to handle.
+            return None 
 
-        prompt_embeds = [encode_prompt(
-            example[caption_column]) for example in examples]
-        input_ids = torch.stack([example for example in prompt_embeds])
-        input_ids = input_ids.squeeze(1)
+        # 'image' is already a transformed tensor from H5adDataset
+        pixel_values = torch.stack([example["image"] for example in examples]) 
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-        return {"pixel_values": pixel_values,
-                "input_ids": input_ids}
+        # Get perturbation IDs
+        perturb_ids = [example["perturb_id"] for example in examples]
+        
+        # Encode prompts (perturb_ids) one by one
+        # This assumes encode_prompt is designed to take a single string identifier
+        # and returns the embedding (e.g., shape [1, 77, 768])
+        prompt_embeds = []
+        for pid in perturb_ids:
+            try:
+                # Note: encode_prompt uses global dataset_id and naive_conditional
+                embedding = encode_prompt(pid) 
+                prompt_embeds.append(embedding)
+            except Exception as e:
+                logger.error(f"Error encoding prompt for ID '{pid}': {e}")
+                # Handle error: maybe add a default embedding or skip? For now, let's error out if critical.
+                # If non-critical, could append a zero tensor of correct shape?
+                # Example: prompt_embeds.append(torch.zeros(1, 77, 768)) 
+                # Let's re-raise for now to ensure visibility
+                raise RuntimeError(f"Failed to encode prompt for ID '{pid}'. See previous errors.") from e
+        
+        if len(prompt_embeds) != len(examples):
+             # This case shouldn't happen with the current error handling, but good check
+             raise RuntimeError("Mismatch between number of samples and successfully encoded prompts.")
+
+        # Stack the embeddings along the batch dimension
+        # Assumes each embedding is shape [1, 77, 768]
+        input_ids = torch.cat(prompt_embeds, dim=0) # Use torch.cat, not torch.stack
+
+        # Final check of shapes
+        # Expected shape for pixel_values: [batch_size, channels, height, width]
+        # Expected shape for input_ids: [batch_size, 77, 768]
+        # print("pixel_values shape:", pixel_values.shape) # Debug
+        # print("input_ids shape:", input_ids.shape) # Debug
+
+        return {"pixel_values": pixel_values, "input_ids": input_ids}
+    # --- End Updated collate_fn ---
+
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -930,9 +1054,27 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
+        # --- MOVED BLOCK: Set tracker project name from dataset_id if using wandb ---
+        if args.dataset_id and (args.report_to == "wandb" or args.report_to == "all"):
+            if args.tracker_project_name is None: # Only set if not explicitly provided
+                 args.tracker_project_name = args.dataset_id
+                 logger.info(f"Using dataset_id '{args.dataset_id}' as wandb project name.")
+            else:
+                 logger.info(f"Using explicitly provided wandb project name: '{args.tracker_project_name}'")
+        elif (args.report_to == "wandb" or args.report_to == "all") and args.tracker_project_name is None:
+            # Fallback if dataset_id is None but wandb is used and no project name given
+            args.tracker_project_name = "morphodiff-default-project"
+            logger.warning(f"dataset_id not provided and tracker_project_name not set. Using default wandb project: '{args.tracker_project_name}'")
+        # --- End MOVED BLOCK ---
+
         tracker_config = dict(vars(args))
-        tracker_config.pop("validation_prompts")
-        accelerator.init_trackers(args.tracker_project_name, tracker_config)
+        # Remove sensitive or large items if necessary, e.g., validation_prompts if very long
+        if "validation_prompts" in tracker_config:
+            tracker_config.pop("validation_prompts") 
+        try:
+             accelerator.init_trackers(args.tracker_project_name, tracker_config)
+        except Exception as e:
+             logger.error(f"Failed to initialize trackers: {e}")
 
     # Function for unwrapping if model was compiled with `torch.compile`.
     def unwrap_model(model):
@@ -997,18 +1139,27 @@ def main():
     total_trained_steps = args.trained_steps
 
     for epoch in range(first_epoch, args.num_train_epochs):
+        unet.train() # Make sure model is in train mode at the start of each epoch
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
+            # Skip batch if collate_fn returned None due to errors
+            if batch is None: 
+                logger.warning(f"Skipping training step {step} in epoch {epoch} due to data loading errors in the batch.")
+                # We might need to adjust the progress bar if we skip steps frequently
+                # Consider if args.max_train_steps should account for skipped steps
+                continue 
+                
             with accelerator.accumulate(unet):
                 # if generate_img_step0_sign:
-                #     log_validation(
-                #         args,
-                #         accelerator,
-                #         weight_dtype,
-                #         args.trained_steps,
-                #         args.pretrained_model_name_or_path
-                #     )
-                #     generate_img_step0_sign = False
+                #     if accelerator.is_main_process: # Log validation only on main process
+                #         log_validation(
+                #             args,
+                #             accelerator,
+                #             weight_dtype,
+                #             args.trained_steps,
+                #             args.pretrained_model_name_or_path
+                #         )
+                #         generate_img_step0_sign = False
                     
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
@@ -1041,15 +1192,34 @@ def main():
                         latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = batch["input_ids"].float()
+                # Should be shape [bs, 77, 768] from collate_fn
+                encoder_hidden_states = batch["input_ids"].to(accelerator.device, dtype=weight_dtype) # Ensure dtype and device
 
+                # --- Conditional Check Logic ---
+                # The original check might need adjustment depending on how embeddings are generated.
+                # If naive means a specific embedding (e.g., all zeros or ones), check for that pattern.
+                # If conditional means *not* that specific pattern, check for that.
+                # Assuming '1.0' was just a placeholder for a specific naive embedding:
+                # Example check if the naive embedding is all zeros:
+                # if args.naive_conditional == 'naive':
+                #     assert torch.all(encoder_hidden_states == 0.), \
+                #         "encoder_hidden_states should be all zeros for naive SD"
+                # elif args.naive_conditional == 'conditional':
+                #     # check that the encoder_hidden_states are not all zeros
+                #     assert not torch.all(encoder_hidden_states == 0.), \
+                #         "encoder_hidden_states should not be all zeros for MorphoDiff"
+                # Let's keep the original logic for now, assuming 1.0 is the intended check value.
                 if args.naive_conditional == 'naive':
-                    assert torch.all(encoder_hidden_states == 1.), \
-                        "encoder_hidden_states should be all ones for naive SD"
+                     # Check if the mean is close to 1.0, allowing for floating point inaccuracy
+                     is_all_ones = torch.allclose(encoder_hidden_states, torch.ones_like(encoder_hidden_states))
+                     assert is_all_ones, \
+                         f"encoder_hidden_states should be all ones for naive SD, but got mean {encoder_hidden_states.mean().item()}"
                 elif args.naive_conditional == 'conditional':
-                    # check that the encoder_hidden_states are not all ones
-                    assert not torch.all(encoder_hidden_states == 1.), \
-                        "encoder_hidden_states should not be all ones for MorphoDiff"
+                     # check that the encoder_hidden_states are not all ones
+                     is_all_ones = torch.allclose(encoder_hidden_states, torch.ones_like(encoder_hidden_states))
+                     assert not is_all_ones, \
+                         f"encoder_hidden_states should not be all ones for MorphoDiff, but they appear to be."
+                # --- End Conditional Check ---
 
                 # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:
@@ -1107,18 +1277,40 @@ def main():
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
-                if args.use_ema:
-                    ema_unet.step(unet.parameters())
-                if accelerator.is_main_process:
-                    progress_bar.update(1)
-                global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
-                train_loss = 0.0
-                total_trained_steps = global_step + args.trained_steps
-                print('global_step:', global_step, 'total_trained_steps:', total_trained_steps)
+                if args.use_ema and ema_unet is not None: # Check if ema_unet exists
+                     # Pass unwrapped unet parameters to EMA
+                     # ema_unet.step(unet.parameters()) # Original
+                     # Pass parameters of the *accelerator-prepared* model
+                     # Need to unwrap first if using deepspeed/fsdp?
+                     # Let's assume accelerator handles unwrapping internally if needed for EMA step.
+                     # Check EMA documentation for use with Accelerate.
+                     # Usually, you step EMA with the *original* model's parameters.
+                     # Let's try passing the unwrapped model's parameters.
+                     ema_unet.step(accelerator.unwrap_model(unet).parameters()) 
 
-                if (global_step == args.max_train_steps) | (global_step % 10000 == 0):
+                progress_bar.update(1)
+                global_step += 1
+                # Log training loss
+                accelerator.log({"train_loss": train_loss}, step=global_step) # Use global_step for logging
+                
+                # Log learning rate
+                if lr_scheduler is not None:
+                     lr = lr_scheduler.get_last_lr()[0]
+                     accelerator.log({"lr": lr}, step=global_step)
+                     
+                train_loss = 0.0 # Reset accumulated loss
+                total_trained_steps = global_step + args.trained_steps # Calculate total steps including previous runs
+                # print('global_step:', global_step, 'total_trained_steps:', total_trained_steps) # Debug print
+
+                # --- Checkpointing Logic ---
+                # Check if checkpointing is due based on total_trained_steps and checkpointing_steps
+                # Also checkpoint at the very last step
+                should_checkpoint = (total_trained_steps % args.checkpointing_steps == 0) or \
+                                    (global_step >= args.max_train_steps)
+                
+                if should_checkpoint:
                     if accelerator.is_main_process:
+                        logger.info(f"Checkpointing at total trained step {total_trained_steps} (global step {global_step})")
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
@@ -1156,58 +1348,170 @@ def main():
                         save_path = os.path.join(
                             args.output_dir, f"checkpoint-{total_trained_steps}")
                         accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+                        logger.info(f"Saved accelerator state to {save_path}")
 
-                        # save checkpoint
+                        # --- Save Model Components Manually for Pipeline ---
+                        logger.info("Saving model components for pipeline...")
+                        unet_ckpt = accelerator.unwrap_model(unet) # Unwrap the model
 
-                        unet_ckpt = unwrap_model(unet)
-                        if args.use_ema:
-                            ema_unet.copy_to(unet_ckpt.parameters())
+                        # Apply EMA weights to the unwrapped model if EMA is used
+                        if args.use_ema and ema_unet is not None:
+                            logger.info("Applying EMA weights to saved model.")
+                            # Store current weights
+                            # current_state_dict = {k: v.clone() for k, v in unet_ckpt.state_dict().items()}
+                            ema_unet.copy_to(unet_ckpt.parameters()) 
+
+                        # Save UNet
+                        unet_save_path = os.path.join(save_path, "unet")
+                        unet_ckpt.save_pretrained(unet_save_path)
+                        logger.info(f"Saved UNet model to {unet_save_path}")
                         
-                        feature_extractor = AutoFeatureExtractor.from_pretrained(
-                            args.pretrained_vae_path+'/feature_extractor')
+                        # Restore original weights if EMA was applied temporarily for saving
+                        # if args.use_ema and ema_unet is not None:
+                        #    unet_ckpt.load_state_dict(current_state_dict)
+                        #    logger.info("Restored original model weights after EMA save.")
 
-                        pipeline = StableDiffusionPipeline(
-                            vae=accelerator.unwrap_model(vae),
-                            text_encoder=None,
-                            tokenizer=None,
-                            unet=unet_ckpt,
-                            scheduler=noise_scheduler,
-                            feature_extractor=feature_extractor,
-                            safety_checker=None,
-                        )
-                        pipeline.save_pretrained(save_path)
-                        with open(os.path.join(save_path, 'training_config.json'), 'w') as f:
-                            f.write(json.dumps(vars(args), indent=2))
 
-                        # if (args.validation_prompts is not None) and \
-                        #     ((global_step % args.validation_epochs == 0) | (global_step == args.max_train_steps)):
+                        # Save Scheduler
+                        noise_scheduler.save_pretrained(os.path.join(save_path, "scheduler"))
+                        logger.info(f"Saved Scheduler config to {os.path.join(save_path, 'scheduler')}")
 
-                        #     log_validation(
-                        #         args,
-                        #         accelerator,
-                        #         weight_dtype,
-                        #         total_trained_steps,
-                        #         save_path
-                        #     )
+                        # Save VAE config (VAE is frozen, so no need to save weights unless fine-tuned)
+                        # We need the VAE config for the pipeline, but weights come from original path
+                        vae_config_save_path = os.path.join(save_path, "vae")
+                        os.makedirs(vae_config_save_path, exist_ok=True)
+                        # Save VAE config - Assuming vae is the loaded AutoencoderKL instance
+                        # Need to unwrap VAE as well if prepared by accelerator? Usually frozen models aren't.
+                        # Let's assume vae is not wrapped or doesn't need unwrapping here.
+                        try:
+                             # Save the config file
+                             vae.save_config(vae_config_save_path)
+                             logger.info(f"Saved VAE config to {vae_config_save_path}")
+                             # We might also need the feature extractor config if it's not standard
+                             feature_extractor_save_path = os.path.join(save_path, "feature_extractor")
+                             os.makedirs(feature_extractor_save_path, exist_ok=True)
+                             # Load feature extractor from original path to save its config
+                             # This assumes it's standard and loaded during validation - maybe load it once here?
+                             try:
+                                 # Need to define feature_extractor earlier or pass path via args
+                                 # Let's load it from the VAE path as per validation logic
+                                 feature_extractor_orig_path = os.path.join(args.pretrained_vae_path, 'feature_extractor')
+                                 if os.path.isdir(feature_extractor_orig_path):
+                                     feature_extractor = AutoFeatureExtractor.from_pretrained(feature_extractor_orig_path)
+                                     feature_extractor.save_pretrained(feature_extractor_save_path)
+                                     logger.info(f"Saved Feature Extractor config to {feature_extractor_save_path}")
+                                 else:
+                                     logger.warning(f"Feature extractor directory not found at {feature_extractor_orig_path}, cannot save config.")
+                             except Exception as e:
+                                 logger.error(f"Could not load or save feature extractor config: {e}")
+
+                        except Exception as e:
+                             logger.error(f"Error saving VAE/Feature Extractor config: {e}")
+
+
+                        # Save training arguments
+                        try:
+                            args_dict = vars(args)
+                            # Convert Path objects to strings for JSON serialization
+                            for key, value in args_dict.items():
+                                if isinstance(value, Path):
+                                    args_dict[key] = str(value)
                             
-                        # write in the args.checkpointing_log_file file
-                        with open(args.checkpointing_log_file, "a") as f:
-                            f.write(args.dataset_id+','+args.logging_dir+','+args.pretrained_model_name_or_path+','+save_path+',' +
-                                    str(args.seed)+','+str(total_trained_steps)+','+str(args.checkpoint_number)+"\n")
+                            with open(os.path.join(save_path, 'training_args.json'), 'w') as f:
+                                json.dump(args_dict, f, indent=2)
+                            logger.info(f"Saved training arguments to {os.path.join(save_path, 'training_args.json')}")
+                        except Exception as e:
+                            logger.error(f"Failed to save training arguments: {e}")
 
-            logs = {"step_loss": loss.detach().item(),
-                    "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
-            if args.total_steps == total_trained_steps:
-                return
-            print('step:', step, 'global_step:', global_step, 'total_trained_steps:', total_trained_steps)
-            print('args.max_train_steps:', args.max_train_steps)
-            if global_step == args.max_train_steps:
-                return
 
+                        # --- Deprecated Pipeline Saving within checkpoint ---
+                        # pipeline = StableDiffusionPipeline(
+                        #     vae=accelerator.unwrap_model(vae), # Use unwrapped VAE
+                        #     text_encoder=None, # No text encoder in this setup
+                        #     tokenizer=None, # No tokenizer
+                        #     unet=unet_ckpt, # Use the potentially EMA-applied UNet
+                        #     scheduler=noise_scheduler, # Use the current noise scheduler
+                        #     feature_extractor=feature_extractor, # Need feature extractor instance
+                        #     safety_checker=None, # No safety checker
+                        # )
+                        # try:
+                        #     pipeline.save_pretrained(save_path)
+                        #     logger.info(f"Saved full pipeline to {save_path}")
+                        # except Exception as e:
+                        #     logger.error(f"Failed to save pipeline: {e}")
+                        # --- End Deprecated Pipeline Saving ---
+
+                        # # Run validation using the *saved checkpoint path*
+                        # if (args.validation_prompts is not None):
+                        #      # Check if validation should run at this step
+                        #      is_validation_step = (total_trained_steps % args.validation_epochs == 0) or \
+                        #                           (global_step >= args.max_train_steps)
+                             
+                        #      if is_validation_step:
+                        #          logger.info(f"Running validation at total trained step {total_trained_steps}.")
+                        #          try:
+                        #              # Pass the save_path (checkpoint directory) to log_validation
+                        #              log_validation(
+                        #                  args,
+                        #                  accelerator,
+                        #                  weight_dtype,
+                        #                  total_trained_steps, # Pass total steps for logging clarity
+                        #                  save_path # Pass the path to the saved checkpoint
+                        #              )
+                        #          except Exception as e:
+                        #              logger.error(f"Validation failed at step {total_trained_steps}: {e}")
+                            
+                        # write checkpoint info to the log file
+                        try:
+                            # Ensure file exists and write header if needed (idempotent check)
+                            if not os.path.exists(args.checkpointing_log_file):
+                                with open(args.checkpointing_log_file, "w") as f:
+                                     # Define header based on expected columns
+                                     header = "dataset_id,log_dir,pretrained_model_dir,checkpoint_dir,seed,trained_steps,checkpoint_number\n"
+                                     f.write(header)
+                                     logger.info(f"Created checkpoint log file: {args.checkpointing_log_file}")
+
+                            with open(args.checkpointing_log_file, "a") as f:
+                                f.write(f"{args.dataset_id or 'N/A'},"
+                                        f"{args.logging_dir},"
+                                        f"{args.pretrained_model_name_or_path}," # Log the initial base model path
+                                        f"{save_path}," # Log the specific checkpoint path saved
+                                        f"{args.seed},"
+                                        f"{total_trained_steps}," # Log total steps reached at this checkpoint
+                                        f"{args.checkpoint_number or 'N/A'}\n") # Log the provided checkpoint number if any
+                                logger.info(f"Appended checkpoint info to {args.checkpointing_log_file}")
+                        except Exception as e:
+                             logger.error(f"Failed to write to checkpoint log file {args.checkpointing_log_file}: {e}")
+
+            # Log step loss and learning rate (already logged inside sync_gradients block)
+            # logs = {"step_loss": loss.detach().item(),
+            #         "lr": lr_scheduler.get_last_lr()[0]}
+            # progress_bar.set_postfix(**logs)
+
+            # Check for termination based on total steps (moved from original code)
+            if args.total_steps > 0 and total_trained_steps >= args.total_steps:
+                 logger.info(f"Reached target total steps ({args.total_steps}). Stopping training.")
+                 break # Break from inner step loop
+
+            # Check for termination based on max_train_steps (steps in this run)
+            if global_step >= args.max_train_steps:
+                logger.info(f"Reached max_train_steps ({args.max_train_steps}) for this run. Stopping training.")
+                break # Break from inner step loop
+                
+        # End of step loop
+        if global_step >= args.max_train_steps or (args.total_steps > 0 and total_trained_steps >= args.total_steps):
+             break # Break from outer epoch loop if training finished
+
+    # End Training
+    logger.info("Training finished.")
+    accelerator.wait_for_everyone() # Ensure all processes finish cleanly
+    
+    # Final Checkpointing and Validation (optional, could be redundant if last step checkpointed)
+    # Consider if a final save/validation outside the loop is needed
+    
+    # Clean up trackers
     accelerator.end_training()
-
+    logger.info("Accelerator ended training.")
 
 if __name__ == "__main__":
     main()
