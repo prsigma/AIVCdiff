@@ -1,18 +1,3 @@
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-
 import argparse
 import logging
 import math
@@ -32,6 +17,7 @@ from torch.utils.data import Dataset
 from PIL import Image
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
@@ -53,164 +39,247 @@ from diffusers.training_utils import EMAModel, compute_snr
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, make_image_grid
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
+import random
 
+# import debugpy
+# # 设置调试服务器
+# debugpy.listen(("localhost", 9999))
+# print("等待调试器连接...")
+# debugpy.wait_for_client()  # 暂停执行直到调试器连接
+# print("调试器已连接，继续执行...")
+    
 
 if is_wandb_available():
     import wandb
     os.environ['WANDB_DIR'] = "tmp/"
     # os.environ["WANDB_MODE"] = "dryrun"
 
-
-# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.26.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
-DATASET_NAME_MAPPING = {
-    # Removed default mapping as we are not using datasets hub anymore
-    # "lambdalabs/pokemon-blip-captions": ("image", "text"),
-}
 
+class RNAEncoder(nn.Module):
+    """ Simple MLP encoder for RNA data. """
+    def __init__(self, input_dim, latent_dim, hidden_dim=512):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
 
-class CustomStableDiffusionPipeline(StableDiffusionPipeline):
-    def __init__(self,
-                 vae,
-                 text_encoder,
-                 unet,
-                 scheduler,
-                 feature_extractor,
-                 tokenizer=None,
-                 safety_checker=None,
-                 image_encoder=None,
-                 requires_safety_checker=False):
-        super().__init__(vae=vae,
-                         text_encoder=text_encoder,
-                         tokenizer=tokenizer,
-                         unet=unet,
-                         scheduler=scheduler,
-                         safety_checker=safety_checker,
-                         feature_extractor=feature_extractor,
-                         image_encoder=image_encoder,
-                         requires_safety_checker=requires_safety_checker)
-        self.custom_text_encoder = text_encoder
+    def forward(self, x):
+        h = F.relu(self.fc1(x))
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        return mu, logvar
 
-    def encode_prompt(
-        self,
-        prompt,
-        device,
-        num_images_per_prompt=1,
-        do_classifier_free_guidance=False,
-        negative_prompt=None,
-        prompt_embeds: Optional[torch.FloatTensor] = None,
-        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
-        lora_scale: Optional[float] = None,
-        clip_skip: Optional[int] = None,
-    ):
-        embeddings = self.custom_text_encoder(prompt)
-        embeddings = embeddings.to(device)
-        return embeddings, None
+class RNADecoder(nn.Module):
+    """ Simple MLP decoder for RNA data. """
+    def __init__(self, latent_dim, output_dim, hidden_dim=512):
+        super().__init__()
+        self.fc1 = nn.Linear(latent_dim, hidden_dim)
+        self.fc_out_mu = nn.Linear(hidden_dim, output_dim)
+        self.fc_out_logvar = nn.Linear(hidden_dim, output_dim) # For GaussianNLLLoss
 
+    def forward(self, z):
+        h = F.relu(self.fc1(z))
+        mu = self.fc_out_mu(h)
+        logvar = self.fc_out_logvar(h) # Predict log variance
+        return mu, logvar
 
-def log_validation(args, accelerator, weight_dtype, step, ckpt_path):
-    """ Log validation images to tensorboard and wandb.
-    
-    Args:
-        args (argparse.Namespace): The parsed arguments.
-        accelerator (Accelerator): The Accelerator object.
-        weight_dtype (str): The weight dtype used for training.
-        step (int): The current training step.
-        ckpt_path (str): The path to the checkpoint.
+class MorphoDiffRNA(nn.Module):
+    """ Main model integrating UNet, RNA VAE, and fusion logic. """
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+
+        try:
+            import pandas as pd
+            self.drug_embeddings_df = pd.read_csv(args.perturbation_embedding_path, index_col=0) 
+            self.drug_embedding_dim = self.drug_embeddings_df.shape[1]
+            logger.info(f"从{args.perturbation_embedding_path}加载药物嵌入，维度为{self.drug_embedding_dim}")
+        except Exception as e:
+            logger.error(f"无法从{args.perturbation_embedding_path}加载药物嵌入：{e}")
+            raise
         
-    Returns:
-        List[torch.Tensor]: The validation images.
-    """
-    logger.info("Running validation... ")
+        self.register_buffer("drug_embeddings_tensor", torch.tensor(self.drug_embeddings_df.values, dtype=torch.float32))
+        self.drug_id_to_idx = {name: i for i, name in enumerate(self.drug_embeddings_df.index)}
 
-    if args.pretrained_vae_path != ckpt_path:
-        if not os.path.exists(ckpt_path+'/feature_extractor'):
-            os.makedirs(ckpt_path+'/feature_extractor')
-        shutil.copyfile(
-            args.pretrained_vae_path+'/feature_extractor/preprocessor_config.json',
-            ckpt_path+'/feature_extractor/preprocessor_config.json')
-        unet = UNet2DConditionModel.from_pretrained(
-            ckpt_path, subfolder="unet_ema", use_auth_token=True)
-    else:
-        unet = UNet2DConditionModel.from_pretrained(
-            ckpt_path, subfolder="unet", use_auth_token=True)
-
-    feature_extractor = AutoFeatureExtractor.from_pretrained(
-        ckpt_path+'/feature_extractor')
-
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_vae_path,
-        subfolder="vae")
-
-    noise_scheduler = DDPMScheduler.from_pretrained(
-        ckpt_path, subfolder="scheduler")
-
-    custom_text_encoder = PerturbationEncoderInference(
-        args.dataset_id, args.naive_conditional, 'SD')
-
-    pipeline = CustomStableDiffusionPipeline(
-        vae=vae,
-        unet=unet,
-        text_encoder=custom_text_encoder,
-        feature_extractor=feature_extractor,
-        scheduler=noise_scheduler)
-
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(
-            args.seed)
-
-    validation_path = args.output_dir+"/checkpoint-"+str(step) +\
-        "/validation/"
-    if not os.path.exists(validation_path):
-        os.makedirs(validation_path,exist_ok=True)
-
-    images = []
-    updated_validation_prompts = []
-    for i in range(len(args.validation_prompts)):
-        for j in range(3):
-            with torch.autocast("cuda"):
-                image = pipeline(
-                    args.validation_prompts[i],
-                    generator=generator).images[0]
-            images.append(image)
-            updated_validation_prompts.append(args.validation_prompts[i]+'-'+str(j))
-
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images(
-                "validation", np_images, step, dataformats="NHWC")
-        elif tracker.name == "wandb":
-            tracker.log(
-                {
-                    "validation": [
-                        wandb.Image(
-                            image,
-                            caption=f"{i}: {updated_validation_prompts[i]} - step {step}",)
-                        for i, image in enumerate(images)
-                    ]
-                }
+        
+        self.vae = AutoencoderKL.from_pretrained(
+            args.pretrained_vae_path,
+            subfolder="vae", revision=args.revision, variant=args.variant
+        )
+        if args.pretrained_model_name_or_path == args.pretrained_vae_path:
+            self.unet = UNet2DConditionModel.from_pretrained(
+                args.pretrained_model_name_or_path,
+                subfolder="unet", revision=args.non_ema_revision
             )
-
         else:
-            logger.warn(f"image logging not implemented for {tracker.name}")
+            self.unet = UNet2DConditionModel.from_pretrained(
+                args.pretrained_model_name_or_path,
+                subfolder="unet_ema", revision=args.non_ema_revision
+            )
+        
+        self.vae.requires_grad_(False)
+        logger.info("图像VAE已冻结。")
+        
+        
+        self.rna_encoder = RNAEncoder(args.rna_input_dim + self.drug_embedding_dim + 2, args.rna_latent_dim)
+        self.rna_decoder = RNADecoder(args.rna_latent_dim, args.rna_input_dim)
+        logger.info(f"初始化RNA编码器/解码器，输入维度{args.rna_input_dim}，潜在维度{args.rna_latent_dim}")
 
-    del pipeline
-    torch.cuda.empty_cache()
+        # 将RNA潜在空间投影到UNet条件维度
+        self.rna_latent_proj = nn.Linear(args.rna_latent_dim, args.condition_dim)
+        logger.info(f"初始化RNA潜在投影层：从{args.rna_latent_dim}到{args.condition_dim}")
+        
+        if args.enable_xformers_memory_efficient_attention:
+            self.enable_xformers_memory_efficient_attention()
+           
+        if args.gradient_checkpointing:
+            self.unet.enable_gradient_checkpointing()
+            logger.info("为UNet启用梯度检查点。")
 
-    return images
+    def train(self, mode=True):
+        """
+        重写train方法，确保VAE保持在eval模式，即使模型设置为train模式
+        """
+    
+        # 先将整个模型设为训练/评估模式
+        super().train(mode)
 
+        # 冻结图像VAE
+        self.vae.requires_grad_(False)
+        logger.info("图像VAE已冻结。")
+        
+        self.vae.eval()
+        logger.info("VAE保持在评估模式，即使模型切换到训练模式。")
+            
+        return self
+
+    # 用于递归应用梯度检查点的辅助函数
+    def _set_gradient_checkpointing(self, module, value=True):
+        if isinstance(module, (nn.Linear)): # 如果需要，添加其他类型
+            module.gradient_checkpointing = value
+            
+    def enable_xformers_memory_efficient_attention(self):
+        if is_xformers_available():
+            import xformers
+            xformers_version = version.parse(xformers.__version__)
+            if xformers_version == version.parse("0.0.16"):
+                logger.warn(
+                    "xFormers 0.0.16不能用于训练...请更新xFormers..."
+                )
+            try:
+                self.unet.enable_xformers_memory_efficient_attention()
+                logger.info("为UNet启用xFormers内存高效注意力。")
+            except Exception as e:
+                logger.warning(f"无法为UNet启用xformers：{e}")
+        else:
+            logger.warning("xFormers不可用。")
+           
+    def get_drug_embedding(self, perturb_ids):
+        """ 通过ID检索预计算的药物嵌入。 """
+        indices = [self.drug_id_to_idx.get(pid) for pid in perturb_ids]
+        if None in indices:
+            missing_ids = [pid for pid, idx in zip(perturb_ids, indices) if idx is None]
+            raise ValueError(f"在嵌入文件中未找到扰动ID：{missing_ids}")
+        indices = torch.tensor(indices, device=self.drug_embeddings_tensor.device, dtype=torch.long)
+        return self.drug_embeddings_tensor[indices]
+    
+    def reparameterize(self, mu, logvar):
+        """ VAE的重参数化技巧。 """
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, batch, noise_scheduler):
+        """ 用于训练的完整前向传递。 """
+        images = batch["pixel_values"] # 图像张量
+        rna_ctrl = batch["rna_ctrl"]   # 对照RNA表达
+        rna_perturb = batch["rna_perturb"]  # 扰动后的RNA表达（目标）
+        perturb_ids = batch["perturb_id"]  # 扰动ID列表
+        
+        # 获取剂量和时间信息
+        pert_dose = batch.get("pert_dose", torch.ones(len(perturb_ids), 1, device=images.device))
+        pert_time = batch.get("pert_time", torch.ones(len(perturb_ids), 1, device=images.device))
+        
+        # 1. 编码图像到潜在空间
+        latents = self.vae.encode(images.to(dtype=self.vae.dtype)).latent_dist.sample()
+        latents = latents * self.vae.config.scaling_factor
+
+        # 2. 为扩散采样噪声和时间步
+        noise = torch.randn_like(latents)
+        # 如果指定，添加噪声偏移
+        if self.args.noise_offset:
+            noise += self.args.noise_offset * torch.randn(
+                (latents.shape[0], latents.shape[1], 1, 1),
+                device=latents.device
+            )
+        # 如果指定，输入扰动
+        if self.args.input_perturbation:
+            effective_noise = noise + self.args.input_perturbation * torch.randn_like(noise)
+        else:
+            effective_noise = noise
+            
+        bsz = latents.shape[0]
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+        timesteps = timesteps.long()
+        
+        # 3. 向潜在变量添加噪声（前向扩散）
+        noisy_latents = noise_scheduler.add_noise(latents, effective_noise, timesteps)
+
+        # 4. 准备条件向量
+        # 4a. 获取药物嵌入
+        drug_embed = self.get_drug_embedding(perturb_ids).to(latents.device)
+        
+        # 4b. 将对照RNA、药物嵌入、剂量和时间连接起来作为RNA编码器的输入
+        rna_encoder_input = torch.cat([
+            rna_ctrl.to(latents.device),
+            drug_embed,
+            pert_dose.to(latents.device),
+            pert_time.to(latents.device)
+        ], dim=1)
+        
+        # 4c. 通过RNA编码器获取潜在表示
+        rna_latent_mu, rna_latent_logvar = self.rna_encoder(rna_encoder_input)
+        rna_latent = self.reparameterize(rna_latent_mu, rna_latent_logvar)
+        
+        # 4d. 解码RNA潜在表示以获得预测的扰动RNA
+        rna_perturb_pred_mu, rna_perturb_pred_logvar = self.rna_decoder(rna_latent)
+        
+        # 4e. 将RNA潜在表示投影为UNet的条件
+        condition_embed = self.rna_latent_proj(rna_latent)
+        
+        # 4f. 扩展为UNet（需要序列长度，例如77）
+        # 假设UNet期望[batch_size, seq_len, condition_dim]
+        seq_len = 77
+                
+        # 重塑condition_embed: [batch_size, condition_dim] -> [batch_size, 1, condition_dim]
+        condition_embed = condition_embed.unsqueeze(1)
+        # 沿序列长度维度重复
+        encoder_hidden_states = condition_embed.repeat(1, seq_len, 1)
+
+        # 5. UNet预测
+        model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        # 6. 计算图像损失目标
+        if noise_scheduler.config.prediction_type == "epsilon":
+            image_target = effective_noise # 预测添加的噪声
+        elif noise_scheduler.config.prediction_type == "v_prediction":
+            image_target = noise_scheduler.get_velocity(latents, effective_noise, timesteps)
+        else:
+            raise ValueError(f"不支持的预测类型：{noise_scheduler.config.prediction_type}")
+
+        return {
+            "image_pred": model_pred,
+            "image_target": image_target,
+            "rna_perturb_pred_mu": rna_perturb_pred_mu,
+            "rna_perturb_pred_logvar": rna_perturb_pred_logvar,
+            "rna_perturb_target": rna_perturb.to(latents.device), # RNA损失的真实值
+            "rna_latent_mu": rna_latent_mu,     # 用于KL的潜在分布的mu
+            "rna_latent_logvar": rna_latent_logvar # 用于KL的潜在分布的logvar
+        }
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -549,6 +618,75 @@ def parse_args():
             "The total number of steps to train."
         ),
     )
+    parser.add_argument(
+        "--rna_input_dim", type=int, required=True,
+        help="Input dimension of RNA expression data (number of genes)."
+    )
+    parser.add_argument(
+        "--rna_latent_dim", type=int, default=128,
+        help="Latent dimension for the RNA VAE."
+    )
+    parser.add_argument(
+        "--fusion_proj_dim", type=int, default=256,
+        help="Dimension to project drug and RNA embeddings before fusion."
+    )
+    parser.add_argument(
+        "--condition_dim", type=int, default=768,
+        help="Output dimension of the fusion layer (input dim for UNet cross-attention)."
+    )
+    parser.add_argument(
+        "--perturbation_embedding_path", type=str, required=True,
+        help="Path to the precomputed perturbation (drug) embeddings CSV file."
+    )
+    parser.add_argument(
+        "--rna_ctrl_data_path", type=str, required=True,
+        help="Path to the h5ad file containing control RNA profiles."
+    )
+    parser.add_argument(
+        "--rna_loss_weight", type=float, default=0.1,
+        help="Weight for the RNA reconstruction loss term."
+    )
+    parser.add_argument(
+        "--kl_loss_weight", type=float, default=0.01,
+        help="Weight for the KL divergence loss term in RNA VAE."
+    )
+    parser.add_argument(
+        "--image_loss_weight", type=float, default=1.0,
+        help="Weight for the image diffusion loss term."
+    )
+    parser.add_argument(
+        "--use_dynamic_loss_scaling",
+        action="store_true",
+        help="是否使用动态损失权重缩放"
+    )
+    parser.add_argument(
+        "--dynamic_weight_alpha",
+        type=float,
+        default=0.01,
+        help="动态权重学习率"
+    )
+    parser.add_argument(
+        "--kl_annealing",
+        action="store_true",
+        help="是否使用KL退火策略"
+    )
+    parser.add_argument(
+        "--kl_annealing_steps",
+        type=int,
+        default=1000,
+        help="KL退火步数"
+    )
+    parser.add_argument(
+        "--max_kl_weight",
+        type=float,
+        default=1.0,
+        help="KL退火最大权重"
+    )
+    parser.add_argument(
+        "--loss_log_scale",
+        action="store_true",
+        help="是否对损失值进行对数变换"
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -586,85 +724,129 @@ def parse_args():
 
     return args
 
-
-def encode_prompt(identifier):
-    """Get gene embedding generated by scGPT based on input identifier.
-
-    Args:
-        identifier (str): perturbation identifier
-
-    Returns:
-        prompt_embeds (torch.Tensor): gene embedding"""
-    global dataset_id
-    global naive_conditional
-    encoder = PerturbationEncoder(dataset_id, naive_conditional, 'SD')
-    prompt_embeds = encoder.get_gene_embedding(identifier)
-    # shape (bs, 77, 768)
-    return prompt_embeds
-
-
-# +++ Added H5adDataset +++
+# +++ Updated H5adDataset ++
 class H5adDataset(Dataset):
-    def __init__(self, adata_path, image_path_column, perturb_id_column, transform=None, image_root_dir=""):
-        """
-        Args:
-            adata_path (str): Path to the h5ad file.
-            image_path_column (str): Column name in adata.obs for image paths.
-            perturb_id_column (str): Column name in adata.obs for perturbation IDs.
-            transform (callable, optional): Optional transform to be applied on a sample's image.
-            image_root_dir (str, optional): Root directory to prepend to relative image paths. Defaults to "".
-        """
+    def __init__(self, adata_path, image_path_column, perturb_id_column, adata_ctrl_path, transform=None, image_root_dir="", rna_input_dim=None):
         self.adata_path = adata_path
-        try:
-            self.adata = ad.read_h5ad(adata_path)
-            logger.info(f"Successfully loaded AnnData from {adata_path} with {len(self.adata)} observations.")
-        except Exception as e:
-            logger.error(f"Failed to load AnnData file {adata_path}: {e}")
-            raise # Reraise the exception to stop execution if file loading fails
-
+        self.adata_ctrl_path = adata_ctrl_path
         self.image_path_column = image_path_column
         self.perturb_id_column = perturb_id_column
         self.transform = transform
         self.image_root_dir = image_root_dir
 
-        # Validate column existence
+        # --- 加载主要AnnData --- 
+        try:
+            self.adata = ad.read_h5ad(adata_path)
+            # 确保X是numpy数组
+            if not isinstance(self.adata.X, np.ndarray):
+                 logger.info("Converting main AnnData .X to dense numpy array.")
+                 self.adata.X = self.adata.X.toarray()
+            logger.info(f"Loaded main AnnData from {adata_path} with {len(self.adata)} obs.")
+        except Exception as e:
+            logger.error(f"Failed to load main AnnData file {adata_path}: {e}")
+            raise
+            
+        # --- 加载对照组AnnData ---
+        try:
+            self.adata_ctrl = ad.read_h5ad(adata_ctrl_path)
+            # 确保X是numpy数组
+            if not isinstance(self.adata_ctrl.X, np.ndarray):
+                logger.info("Converting control AnnData .X to dense numpy array.")
+                self.adata_ctrl.X = self.adata_ctrl.X.toarray()
+            logger.info(f"Loaded control AnnData from {adata_ctrl_path} with {len(self.adata_ctrl)} obs.")
+        except Exception as e:
+            logger.error(f"Failed to load control AnnData file {adata_ctrl_path}: {e}")
+            raise
+
+        # 验证主要adata中的列
         if self.image_path_column not in self.adata.obs.columns:
-            raise ValueError(f"Image path column '{self.image_path_column}' not found in AnnData obs.")
+            raise ValueError(f"Image path column '{self.image_path_column}' not found in main AnnData obs.")
         if self.perturb_id_column not in self.adata.obs.columns:
-             raise ValueError(f"Perturbation ID column '{self.perturb_id_column}' not found in AnnData obs.")
+             raise ValueError(f"Perturbation ID column '{self.perturb_id_column}' not found in main AnnData obs.")
+
+        # 检查pert_dose和pert_time列是否存在
+        self.has_pert_dose = 'pert_dose' in self.adata.obs.columns
+        self.has_pert_time = 'pert_time' in self.adata.obs.columns
+        
+        if not self.has_pert_dose:
+            logger.warning("'pert_dose' column not found in main AnnData obs. Will use default values.")
+        if not self.has_pert_time:
+            logger.warning("'pert_time' column not found in main AnnData obs. Will use default values.")
+
+        # 存储RNA输入维度
+        self.rna_input_dim = self.adata.X.shape[1]
+        if rna_input_dim is not None and self.rna_input_dim != rna_input_dim:
+            raise ValueError(f"Expected RNA dimension {rna_input_dim} but got {self.rna_input_dim}")
+            
+        # 为每种药物创建对照RNA映射
+        self.perturb_to_ctrl = {}
+        unique_perturbs = self.adata.obs[self.perturb_id_column].unique()
+        
+        # 获取对照组的总行数
+        ctrl_total_rows = len(self.adata_ctrl)
+        if ctrl_total_rows == 0:
+            raise ValueError("对照组数据为空，无法创建映射")
+            
+        # 为每种药物随机分配一个不同的对照RNA
+        used_ctrl_indices = set()  
+        
+        for perturb in unique_perturbs:
+            # 找到一个未使用的随机对照组索引
+            available_indices = list(set(range(ctrl_total_rows)) - used_ctrl_indices)
+            
+            # 如果所有对照组样本都已使用，则重新开始
+            if not available_indices:
+                used_ctrl_indices.clear()
+                available_indices = list(range(ctrl_total_rows))
+                
+            # 随机选择一个可用的对照组索引
+            random_ctrl_idx = np.random.choice(available_indices)
+            used_ctrl_indices.add(random_ctrl_idx)
+            
+            # 将药物映射到随机选择的对照组RNA
+            self.perturb_to_ctrl[perturb] = self.adata_ctrl.X[random_ctrl_idx]
+        
+        logger.info(f"为{len(self.perturb_to_ctrl)}种不同的扰动创建了随机对照RNA映射，每种扰动对应不同的对照组样本。")
 
     def __len__(self):
         return len(self.adata)
-
-    def __getitem__(self, idx):
-        if idx >= len(self.adata):
-             raise IndexError("Index out of bounds")
-             
-        image_rel_path = self.adata.obs[self.image_path_column].iloc[idx]
-        # Construct full path if image_root_dir is provided
-        image_path = os.path.join(self.image_root_dir, image_rel_path) if self.image_root_dir else image_rel_path
         
+    def __getitem__(self, idx):
+        # 获取图像路径
+        image_path = self.adata.obs[self.image_path_column].iloc[idx]
+        if self.image_root_dir:
+            image_path = os.path.join(self.image_root_dir, image_path)
+            
+        # 加载图像
         try:
-            # Ensure path separators are correct for the OS
-            image_path = os.path.normpath(image_path)
             image = Image.open(image_path).convert("RGB")
-        except FileNotFoundError:
-            logger.warning(f"Image file not found at {image_path}. Skipping sample index {idx}.")
-            return None # Signal to collate_fn to skip this sample
         except Exception as e:
             logger.warning(f"Error loading image {image_path}: {e}. Skipping sample index {idx}.")
-            return None # Signal to collate_fn to skip this sample
+            return None  
 
-        perturb_id = str(self.adata.obs[self.perturb_id_column].iloc[idx]) # Ensure it's a string
+        # 获取扰动ID和对应的RNA数据
+        perturb_id = str(self.adata.obs[self.perturb_id_column].iloc[idx])  # 确保是字符串
+        rna_perturbed = self.adata.X[idx]  # 获取扰动后的RNA表达
+        rna_ctrl = self.perturb_to_ctrl[perturb_id]  # 获取对应的对照RNA
 
-        sample = {"image": image, "perturb_id": perturb_id}
+        # 获取pert_dose和pert_time
+        pert_dose = float(self.adata.obs['pert_dose'].iloc[idx]) if self.has_pert_dose else 0.0
+        pert_time = float(self.adata.obs['pert_time'].iloc[idx]) if self.has_pert_time else 0.0
+
+        sample = {
+            "image": image, 
+            "perturb_id": perturb_id,
+            "rna_perturb": torch.tensor(rna_perturbed, dtype=torch.float32),
+            "rna_ctrl": torch.tensor(rna_ctrl, dtype=torch.float32),
+            "pert_dose": torch.tensor(pert_dose, dtype=torch.float32).unsqueeze(0),
+            "pert_time": torch.tensor(pert_time, dtype=torch.float32).unsqueeze(0)
+        }
 
         if self.transform:
-            sample["image"] = self.transform(sample["image"]) # Now image is a tensor
+            sample["image"] = self.transform(sample["image"])  # 现在image是一个张量
 
         return sample
 # --- End Added H5adDataset ---
-
 
 def main():
     args = parse_args()
@@ -716,7 +898,7 @@ def main():
 
     def deepspeed_zero_init_disabled_context_manager():
         """
-        returns either a context list that includes one that will disable zero.Init or an empty context list
+        返回一个上下文列表，其中包含一个将禁用zero.Init的上下文，或一个空上下文列表
         """
         deepspeed_plugin = AcceleratorState().deepspeed_plugin if accelerate.state.is_initialized() else None
         if deepspeed_plugin is None:
@@ -724,38 +906,11 @@ def main():
 
         return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
 
-    # Currently Accelerate doesn't know how to handle multiple models under Deepspeed ZeRO stage 3.
-    # For this to work properly all models must be run through `accelerate.prepare`. But accelerate
-    # will try to assign the same optimizer with the same weights to all models during
-    # `deepspeed.initialize`, which of course doesn't work.
-    #
-    # For now the following workaround will partially support Deepspeed ZeRO-3, by excluding the 2
-    # frozen models from being partitioned during `zero.Init` which gets called during
-    # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
-    # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
+    # 创建MorphoDiffRNA模型实例
     with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
-        vae = AutoencoderKL.from_pretrained(
-            args.pretrained_vae_path,
-            subfolder="vae", revision=args.revision, variant=args.variant
-        )
-
-    if args.pretrained_model_name_or_path == args.pretrained_vae_path:
-        
-        unet = UNet2DConditionModel.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="unet", revision=args.non_ema_revision
-        )
-    else:
-        unet = UNet2DConditionModel.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="unet_ema", revision=args.non_ema_revision
-        )
-
-    # Freeze vae and set unet to trainable
-    vae.requires_grad_(False)
-    unet.train()
-
-    # Create EMA for the unet.
+        model = MorphoDiffRNA(args)
+    
+    # 创建EMA模型
     if args.use_ema:
         ema_model_path = args.pretrained_model_name_or_path
         ema_subfolder = "unet" if args.pretrained_model_name_or_path == args.pretrained_vae_path else "unet_ema"
@@ -764,36 +919,21 @@ def main():
                 ema_model_path, subfolder=ema_subfolder, revision=args.revision, variant=args.variant
             )
             ema_unet = EMAModel(
-                 # Pass the parameters of the *trainable* unet model to EMA
                  ema_unet.parameters(), 
-                 model_cls=UNet2DConditionModel, 
+                 model_cls=UNet2DConditionModel,
                  model_config=ema_unet.config
-                 )
-            logger.info("EMA model created successfully.")
+            )
+            logger.info("EMA模型创建成功。")
         except Exception as e:
-             logger.error(f"Failed to create EMA model from {ema_model_path}/{ema_subfolder}: {e}")
-             args.use_ema = False # Disable EMA if creation fails
+             logger.error(f"从{ema_model_path}/{ema_subfolder}创建EMA模型失败: {e}")
+             args.use_ema = False
              ema_unet = None
-             logger.warning("EMA disabled due to error during initialization.")
+             logger.warning("由于初始化过程中出错，EMA已禁用。")
     else:
-         ema_unet = None # Explicitly set to None if not using EMA
+         ema_unet = None
 
-    if args.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            import xformers
-
-            xformers_version = version.parse(xformers.__version__)
-            if xformers_version == version.parse("0.0.16"):
-                logger.warn(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-                )
-            unet.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError("xformers is not available. Make sure it is installed correctly")
-
-    # `accelerate` 0.16.0 will have better support for customized saving
+    
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 if args.use_ema and ema_unet is not None:
@@ -801,8 +941,6 @@ def main():
 
                 for i, model in enumerate(models):
                     model.save_pretrained(os.path.join(output_dir, "unet"))
-
-                    # make sure to pop weight so that corresponding model is not saved again
                     weights.pop()
 
         def load_model_hook(models, input_dir):
@@ -813,13 +951,9 @@ def main():
                 del load_model
 
             for i in range(len(models)):
-                # pop models so that they are not loaded again
                 model = models.pop()
-
-                # load diffusers style into model
                 load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
-
                 model.load_state_dict(load_model.state_dict())
                 del load_model
 
@@ -827,10 +961,8 @@ def main():
         accelerator.register_load_state_pre_hook(load_model_hook)
 
     if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
+        model.unet.enable_gradient_checkpointing()
 
-    # Enable TF32 for faster training on Ampere GPUs,
-    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -839,168 +971,94 @@ def main():
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
-    # Initialize the optimizer
     if args.use_8bit_adam:
         try:
             import bitsandbytes as bnb
         except ImportError:
             raise ImportError(
-                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
+                "请安装bitsandbytes以使用8位Adam。您可以通过运行`pip install bitsandbytes`来安装。"
             )
-
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        filter(lambda p: p.requires_grad, unet.parameters()), # Ensure optimizer only optimizes trainable parameters
+        filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
 
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    # --- Removed old dataset loading logic ---
-    # if args.dataset_name is not None:
-    #     # Downloading and loading a dataset from the hub.
-    #     dataset = load_dataset(
-    #         args.dataset_name,
-    #         args.dataset_config_name,
-    #         cache_dir=args.cache_dir,
-    #         data_dir=args.train_data_dir,
-    #     )
-    # else:
-    #     data_files = {}
-    #     if args.train_data_dir is not None:
-    #         data_files["train"] = os.path.join(args.train_data_dir, "**")
-    #     dataset = load_dataset(
-    #         "imagefolder",
-    #         data_files=data_files,
-    #         cache_dir=args.cache_dir,
-    #     )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-
-    # Preprocessing the datasets.
-    # column_names = dataset["train"].column_names # Removed
-
-    # 6. Get the column names for input/target.
-    # dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None) # Removed
-    # if args.image_column is None:
-    #     image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    # else:
-    #     image_column = args.image_column
-    #     if image_column not in column_names:
-    #         raise ValueError(
-    #             f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
-    #         )
-    # if args.caption_column is None:
-    #     caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    # else:
-    #     caption_column = args.caption_column
-    #     if caption_column not in column_names:
-    #         raise ValueError(
-    #             f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-    #         ) # --- End Removed old dataset loading logic ---
-
-    # Define image transformations
     train_transforms = transforms.Compose(
         [
             transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])]) # Assuming single channel normalization? If RGB, use [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
+            transforms.Normalize([0.5], [0.5])
+        ])
 
-    # def preprocess_train(examples): # Removed
-    #     images = [image.convert("RGB") for image in examples[image_column]]
-    #     examples["pixel_values"] = [train_transforms(image) for image in images]
-    #     return examples
-
-    # Create the H5adDataset
     with accelerator.main_process_first():
+        logger.info(f"创建H5adDataset，使用以下参数：")
+        logger.info(f"  adata_path: {args.train_data_path}")
+        logger.info(f"  adata_ctrl_path: {args.rna_ctrl_data_path}")
+        logger.info(f"  image_path_column: {args.image_path_column}")
+        logger.info(f"  perturb_id_column: {args.perturb_id_column}")
+        logger.info(f"  image_root_dir: {args.image_root_dir}")
+        logger.info(f"  rna_input_dim: {args.rna_input_dim}")
+
         try:
             train_dataset = H5adDataset(
                 adata_path=args.train_data_path,
                 image_path_column=args.image_path_column,
                 perturb_id_column=args.perturb_id_column,
+                adata_ctrl_path=args.rna_ctrl_data_path,  
                 transform=train_transforms,
-                image_root_dir=args.image_root_dir
+                image_root_dir=args.image_root_dir,
+                rna_input_dim=args.rna_input_dim  
             )
-            logger.info(f"Successfully created H5adDataset with {len(train_dataset)} samples.")
+            logger.info(f"成功创建H5adDataset，包含{len(train_dataset)}个样本。")
         except (ValueError, FileNotFoundError) as e:
-             logger.error(f"Error creating H5adDataset: {e}")
-             # Exit if dataset creation fails crucially
-             exit(1) 
-        # Removed max_train_samples logic as it's easier to handle by slicing the h5ad file beforehand if needed.
-        # if args.max_train_samples is not None:
-        #     dataset["train"] = dataset["train"].shuffle(
-        #         seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        # train_dataset = dataset["train"].with_transform(preprocess_train) # Removed
+             logger.error(f"创建H5adDataset时出错: {e}")
+             exit(1)
 
-
-    # +++ Updated collate_fn +++
     def collate_fn(examples):
-        # Filter out None samples caused by loading errors in __getitem__
         original_count = len(examples)
         examples = [e for e in examples if e is not None]
         filtered_count = len(examples)
         
         if original_count != filtered_count:
-             logger.warning(f"Filtered out {original_count - filtered_count} samples due to loading errors in this batch.")
+             logger.warning(f"由于此批次中的加载错误，过滤掉了{original_count - filtered_count}个样本。")
 
         if not examples:
-            # Return an empty dictionary or None if the whole batch failed
-            # Returning None might be simpler for the training loop to handle.
             return None 
 
-        # 'image' is already a transformed tensor from H5adDataset
         pixel_values = torch.stack([example["image"] for example in examples]) 
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-        # Get perturbation IDs
+        # 获取扰动ID
         perturb_ids = [example["perturb_id"] for example in examples]
         
-        # Encode prompts (perturb_ids) one by one
-        # This assumes encode_prompt is designed to take a single string identifier
-        # and returns the embedding (e.g., shape [1, 77, 768])
-        prompt_embeds = []
-        for pid in perturb_ids:
-            try:
-                # Note: encode_prompt uses global dataset_id and naive_conditional
-                embedding = encode_prompt(pid) 
-                prompt_embeds.append(embedding)
-            except Exception as e:
-                logger.error(f"Error encoding prompt for ID '{pid}': {e}")
-                # Handle error: maybe add a default embedding or skip? For now, let's error out if critical.
-                # If non-critical, could append a zero tensor of correct shape?
-                # Example: prompt_embeds.append(torch.zeros(1, 77, 768)) 
-                # Let's re-raise for now to ensure visibility
-                raise RuntimeError(f"Failed to encode prompt for ID '{pid}'. See previous errors.") from e
+        # 获取RNA数据
+        rna_perturb = torch.stack([example["rna_perturb"] for example in examples])
+        rna_ctrl = torch.stack([example["rna_ctrl"] for example in examples])
         
-        if len(prompt_embeds) != len(examples):
-             # This case shouldn't happen with the current error handling, but good check
-             raise RuntimeError("Mismatch between number of samples and successfully encoded prompts.")
+        # 获取剂量和时间
+        pert_dose = torch.stack([example["pert_dose"] for example in examples])
+        pert_time = torch.stack([example["pert_time"] for example in examples])
+        
+        # 创建批次字典
+        batch = {
+            "pixel_values": pixel_values,
+            "perturb_id": perturb_ids,
+            "rna_perturb": rna_perturb,
+            "rna_ctrl": rna_ctrl,
+            "pert_dose": pert_dose,
+            "pert_time": pert_time
+        }
+        
+        return batch
 
-        # Stack the embeddings along the batch dimension
-        # Assumes each embedding is shape [1, 77, 768]
-        input_ids = torch.cat(prompt_embeds, dim=0) # Use torch.cat, not torch.stack
-
-        # Final check of shapes
-        # Expected shape for pixel_values: [batch_size, channels, height, width]
-        # Expected shape for input_ids: [batch_size, 77, 768]
-        # print("pixel_values shape:", pixel_values.shape) # Debug
-        # print("input_ids shape:", input_ids.shape) # Debug
-
-        return {"pixel_values": pixel_values, "input_ids": input_ids}
-    # --- End Updated collate_fn ---
-
-
-    # DataLoaders creation:
+    # 创建DataLoader
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -1009,7 +1067,7 @@ def main():
         num_workers=args.dataloader_num_workers,
     )
 
-    # Scheduler and math around the number of training steps.
+    # 调度器和训练步数的计算
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -1023,16 +1081,14 @@ def main():
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
-    # Prepare everything with our `accelerator`.
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
+    # 使用`accelerator`准备所有内容
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
     )
 
     if args.use_ema:
         ema_unet.to(accelerator.device)
 
-    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -1041,67 +1097,57 @@ def main():
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
 
-    # Move text_encode and vae to gpu and cast to weight_dtype
-    vae.to(accelerator.device, dtype=weight_dtype)
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    # 重新计算总训练步数
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
+    # 重新计算训练轮数
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        # --- MOVED BLOCK: Set tracker project name from dataset_id if using wandb ---
         if args.dataset_id and (args.report_to == "wandb" or args.report_to == "all"):
-            if args.tracker_project_name is None: # Only set if not explicitly provided
+            if args.tracker_project_name is None: 
                  args.tracker_project_name = args.dataset_id
-                 logger.info(f"Using dataset_id '{args.dataset_id}' as wandb project name.")
+                 logger.info(f"使用dataset_id '{args.dataset_id}'作为wandb项目名称。")
             else:
-                 logger.info(f"Using explicitly provided wandb project name: '{args.tracker_project_name}'")
+                 logger.info(f"使用明确提供的wandb项目名称: '{args.tracker_project_name}'")
         elif (args.report_to == "wandb" or args.report_to == "all") and args.tracker_project_name is None:
-            # Fallback if dataset_id is None but wandb is used and no project name given
             args.tracker_project_name = "morphodiff-default-project"
-            logger.warning(f"dataset_id not provided and tracker_project_name not set. Using default wandb project: '{args.tracker_project_name}'")
-        # --- End MOVED BLOCK ---
+            logger.warning(f"未提供dataset_id且未设置tracker_project_name。使用默认wandb项目: '{args.tracker_project_name}'")
 
         tracker_config = dict(vars(args))
-        # Remove sensitive or large items if necessary, e.g., validation_prompts if very long
         if "validation_prompts" in tracker_config:
-            tracker_config.pop("validation_prompts") 
+            tracker_config.pop("validation_prompts")
         try:
-             accelerator.init_trackers(args.tracker_project_name, tracker_config)
+            accelerator.init_trackers(args.tracker_project_name, tracker_config)
         except Exception as e:
-             logger.error(f"Failed to initialize trackers: {e}")
+             logger.error(f"初始化跟踪器失败: {e}")
 
-    # Function for unwrapping if model was compiled with `torch.compile`.
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
         model = model._orig_mod if is_compiled_module(model) else model
         return model
 
-    # Train!
+    # 开始训练！
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info("***** 开始训练 *****")
+    logger.info(f"  样本数量 = {len(train_dataset)}")
+    logger.info(f"  训练轮数 = {args.num_train_epochs}")
+    logger.info(f"  每个设备的即时批次大小 = {args.train_batch_size}")
+    logger.info(f"  总训练批次大小（包括并行、分布式和累积） = {total_batch_size}")
+    logger.info(f"  梯度累积步数 = {args.gradient_accumulation_steps}")
+    logger.info(f"  总优化步数 = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
     
-
-    # Potentially load in the weights and states from a previous save
+    # 可能从之前的保存加载权重和状态
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
         else:
-            # Get the most recent checkpoint
+            # 获取最近的检查点
             dirs = os.listdir(args.output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
@@ -1109,12 +1155,12 @@ def main():
 
         if path is None:
             accelerator.print(
-                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
+                f"检查点'{args.resume_from_checkpoint}'不存在。开始新的训练运行。"
             )
             args.resume_from_checkpoint = None
             initial_global_step = 0
         else:
-            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.print(f"从检查点{path}恢复")
             accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
 
@@ -1123,193 +1169,269 @@ def main():
 
     else:
         initial_global_step = 0
-
-    progress_bar = tqdm(
-        range(0, args.max_train_steps),
-        initial=initial_global_step,
-        desc="Steps",
-        # Only show the progress bar once on each machine.
-        disable=not accelerator.is_local_main_process,
-    )
-    generate_img_step0_sign = True
     
-    # If passed along, set the training seed now.
+    # 初始化动态权重和KL退火
+    if args.use_dynamic_loss_scaling:
+        # 初始化损失权重的对数值，便于动态调整
+        log_image_weight = torch.tensor(math.log(args.image_loss_weight), device=accelerator.device, requires_grad=True)
+        log_rna_weight = torch.tensor(math.log(args.rna_loss_weight), device=accelerator.device, requires_grad=True)
+        log_kl_weight = torch.tensor(math.log(args.kl_loss_weight), device=accelerator.device, requires_grad=True)
+        
+        # 添加到优化器
+        optimizer.add_param_group({'params': [log_image_weight, log_rna_weight, log_kl_weight], 'lr': args.dynamic_weight_alpha})
+        
+        logger.info("启用动态损失权重平衡，初始权重：图像=%.4f，RNA=%.4f，KL=%.4f", 
+                   args.image_loss_weight, args.rna_loss_weight, args.kl_loss_weight)
+    else:
+        logger.info("使用固定损失权重：图像=%.4f，RNA=%.4f，KL=%.4f", 
+                   args.image_loss_weight, args.rna_loss_weight, args.kl_loss_weight)
+    
+    # 如果传入，现在设置训练种子
     if args.seed is not None:
         set_seed(args.seed)
     total_trained_steps = args.trained_steps
 
+    # initial checkpoint save 
+    if not args.resume_from_checkpoint: 
+        accelerator.wait_for_everyone() 
+        if accelerator.is_main_process:
+            initial_save_step = 0 
+            save_path = os.path.join(args.output_dir, f"checkpoint-{initial_save_step}")
+            os.makedirs(save_path, exist_ok=True)
+            logger.info(f"Saving initial state at step {initial_save_step} to {save_path}...")
+
+            if args.checkpoints_total_limit is not None:
+                existing_initial_ckpt = os.path.join(args.output_dir, "checkpoint-0")
+                if os.path.exists(existing_initial_ckpt):
+                    logger.warning(f"Removing existing initial checkpoint {existing_initial_ckpt} before saving new one.")
+                    shutil.rmtree(existing_initial_ckpt, ignore_errors=True)
+
+            optimizer_path = os.path.join(save_path, "optimizer.bin")
+            torch.save(optimizer.state_dict(), optimizer_path)
+            logger.info(f"优化器状态已保存到 {optimizer_path}")
+            
+            # 保存学习率调度器
+            lr_scheduler_path = os.path.join(save_path, "scheduler.bin")
+            torch.save(lr_scheduler.state_dict(), lr_scheduler_path)
+            logger.info(f"学习率调度器已保存到 {lr_scheduler_path}")
+            
+            # 保存随机状态
+            rng_path = os.path.join(save_path, "rng_state.pth")
+            rng_states = {
+                "torch_rng_state": torch.get_rng_state(),
+                "cuda_rng_state": torch.cuda.get_rng_state(),
+                "numpy_rng_state": np.random.get_state(),
+                "random_rng_state": random.getstate(),
+            }
+            torch.save(rng_states, rng_path)
+            logger.info(f"随机状态已保存到 {rng_path}")
+            
+            logger.info(f"已完成模型状态保存到 {save_path}")
+
+            logger.info("保存模型组件用于推理管道...")
+            model_unwrapped = accelerator.unwrap_model(model)
+            unet_ckpt = model_unwrapped.unet
+
+            # 如果使用EMA，将EMA权重应用到保存的模型
+            if args.use_ema and ema_unet is not None:
+                logger.info("将EMA权重应用到保存的模型。")
+                ema_unet.copy_to(unet_ckpt.parameters())
+            
+            # 保存UNet
+            unet_save_path = os.path.join(save_path, "unet")
+            unet_ckpt.save_pretrained(unet_save_path)
+            logger.info(f"UNet模型已保存到 {unet_save_path}")
+            
+            # 保存RNA编码器和解码器
+            rna_encoder_save_path = os.path.join(save_path, "rna_encoder")
+            os.makedirs(rna_encoder_save_path, exist_ok=True)
+            torch.save(model_unwrapped.rna_encoder.state_dict(), os.path.join(rna_encoder_save_path, "pytorch_model.bin"))
+            logger.info(f"RNA编码器已保存到 {rna_encoder_save_path}")
+            
+            rna_decoder_save_path = os.path.join(save_path, "rna_decoder")
+            os.makedirs(rna_decoder_save_path, exist_ok=True)
+            torch.save(model_unwrapped.rna_decoder.state_dict(), os.path.join(rna_decoder_save_path, "pytorch_model.bin"))
+            logger.info(f"RNA解码器已保存到 {rna_decoder_save_path}")
+            
+            # 保存RNA潜在投影层
+            rna_latent_proj_save_path = os.path.join(save_path, "rna_latent_proj")
+            os.makedirs(rna_latent_proj_save_path, exist_ok=True)
+            torch.save(model_unwrapped.rna_latent_proj.state_dict(), os.path.join(rna_latent_proj_save_path, "pytorch_model.bin"))
+            logger.info(f"RNA潜在投影层已保存到 {rna_latent_proj_save_path}")
+            
+            # 保存调度器
+            noise_scheduler.save_pretrained(os.path.join(save_path, "scheduler"))
+            logger.info(f"调度器配置已保存到 {os.path.join(save_path, 'scheduler')}")
+
+            # 保存VAE配置（VAE是冻结的，除非微调，否则无需保存权重）
+            vae_config_save_path = os.path.join(save_path, "vae")
+            os.makedirs(vae_config_save_path, exist_ok=True)
+            try:
+                    # 保存配置文件
+                    model_unwrapped.vae.save_config(vae_config_save_path)
+                    logger.info(f"VAE配置已保存到 {vae_config_save_path}")
+                    # 可能还需要特征提取器配置
+                    feature_extractor_save_path = os.path.join(save_path, "feature_extractor")
+                    os.makedirs(feature_extractor_save_path, exist_ok=True)
+                    try:
+                        feature_extractor_orig_path = os.path.join(args.pretrained_vae_path, 'feature_extractor')
+                        if os.path.isdir(feature_extractor_orig_path):
+                            feature_extractor = AutoFeatureExtractor.from_pretrained(feature_extractor_orig_path)
+                            feature_extractor.save_pretrained(feature_extractor_save_path)
+                            logger.info(f"特征提取器配置已保存到 {feature_extractor_save_path}")
+                        else:
+                            logger.warning(f"在 {feature_extractor_orig_path} 未找到特征提取器目录，无法保存配置。")
+                    except Exception as e:
+                        logger.error(f"无法加载或保存特征提取器配置: {e}")
+            except Exception as e:
+                    logger.error(f"保存VAE/特征提取器配置时出错: {e}")
+
+            # 保存训练参数
+            try:
+                args_dict = vars(args)
+                # 将Path对象转换为字符串以进行JSON序列化
+                for key, value in args_dict.items():
+                    if isinstance(value, Path):
+                        args_dict[key] = str(value)
+                
+                with open(os.path.join(save_path, 'training_args.json'), 'w') as f:
+                    json.dump(args_dict, f, indent=2)
+                logger.info(f"训练参数已保存到 {os.path.join(save_path, 'training_args.json')}")
+            except Exception as e:
+                logger.error(f"保存训练参数失败: {e}")
+
+            # 将检查点信息写入日志文件
+            try:
+                # 确保文件存在并在需要时写入标题（幂等检查）
+                if not os.path.exists(args.checkpointing_log_file):
+                    with open(args.checkpointing_log_file, "w") as f:
+                            # 根据预期列定义标题
+                            header = "dataset_id,log_dir,pretrained_model_dir,checkpoint_dir,seed,trained_steps,checkpoint_number\n"
+                            f.write(header)
+                            logger.info(f"创建检查点日志文件: {args.checkpointing_log_file}")
+
+                with open(args.checkpointing_log_file, "a") as f:
+                    f.write(f"{args.dataset_id or 'N/A'}")
+                    f.write(f"{args.logging_dir}")
+                    f.write(f"{args.pretrained_model_name_or_path}")
+                    f.write(f"{save_path}")
+                    f.write(f"{args.seed}")
+                    f.write(f"{total_trained_steps}")
+                    f.write(f"{args.checkpoint_number or 'N/A'}")
+                    logger.info(f"检查点信息已追加到 {args.checkpointing_log_file}")
+            except Exception as e:
+                    logger.error(f"写入检查点日志文件 {args.checkpointing_log_file} 失败: {e}")
+    
+    progress_bar = tqdm(
+        range(0, args.max_train_steps),
+        initial=initial_global_step,
+        desc="步骤",
+        disable=not accelerator.is_local_main_process,
+    )
+    
     for epoch in range(first_epoch, args.num_train_epochs):
-        unet.train() # Make sure model is in train mode at the start of each epoch
+        model.train()
         train_loss = 0.0
+        train_image_loss = 0.0
+        train_rna_loss = 0.0   
+        train_kl_loss = 0.0    
+        
         for step, batch in enumerate(train_dataloader):
-            # Skip batch if collate_fn returned None due to errors
             if batch is None: 
-                logger.warning(f"Skipping training step {step} in epoch {epoch} due to data loading errors in the batch.")
-                # We might need to adjust the progress bar if we skip steps frequently
-                # Consider if args.max_train_steps should account for skipped steps
+                logger.warning(f"由于批次中的数据加载错误，跳过第{epoch}轮的训练步骤{step}。")
                 continue 
                 
-            with accelerator.accumulate(unet):
-                # if generate_img_step0_sign:
-                #     if accelerator.is_main_process: # Log validation only on main process
-                #         log_validation(
-                #             args,
-                #             accelerator,
-                #             weight_dtype,
-                #             args.trained_steps,
-                #             args.pretrained_model_name_or_path
-                #         )
-                #         generate_img_step0_sign = False
-                    
-                # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
-
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                if args.noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    noise += args.noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1], 1, 1),
-                        device=latents.device
+            with accelerator.accumulate(model):
+                # 通过模型前向传播获取预测和目标
+                outputs = model(batch, noise_scheduler)
+                
+                # 计算KL退火权重
+                if args.kl_annealing:
+                    kl_weight = min(1.0, global_step / args.kl_annealing_steps) * args.max_kl_weight
+                else:
+                    kl_weight = args.kl_loss_weight
+                
+                # 计算各个损失
+                image_reconstruction_loss = F.mse_loss(
+                    outputs["image_pred"].float(),
+                    outputs["image_target"].float(),
+                    reduction="mean")
+                
+                # 对RNA损失进行对数变换
+                if args.loss_log_scale and outputs["rna_perturb_target"] is not None:
+                    rna_reconstruction_loss = F.gaussian_nll_loss(
+                        outputs["rna_perturb_pred_mu"], 
+                        outputs["rna_perturb_target"], 
+                        torch.exp(outputs["rna_perturb_pred_logvar"]),
+                        full=True, 
+                        reduction='mean'
                     )
-                if args.input_perturbation:
-                    new_noise = noise + args.input_perturbation * torch.randn_like(noise)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps,
-                    (bsz,), device=latents.device)
-                timesteps = timesteps.long()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                if args.input_perturbation:
-                    noisy_latents = noise_scheduler.add_noise(
-                        latents, new_noise, timesteps)
+                    rna_reconstruction_loss = torch.log1p(rna_reconstruction_loss)
                 else:
-                    noisy_latents = noise_scheduler.add_noise(
-                        latents, noise, timesteps)
-
-                # Get the text embedding for conditioning
-                # Should be shape [bs, 77, 768] from collate_fn
-                encoder_hidden_states = batch["input_ids"].to(accelerator.device, dtype=weight_dtype) # Ensure dtype and device
-
-                # --- Conditional Check Logic ---
-                # The original check might need adjustment depending on how embeddings are generated.
-                # If naive means a specific embedding (e.g., all zeros or ones), check for that pattern.
-                # If conditional means *not* that specific pattern, check for that.
-                # Assuming '1.0' was just a placeholder for a specific naive embedding:
-                # Example check if the naive embedding is all zeros:
-                # if args.naive_conditional == 'naive':
-                #     assert torch.all(encoder_hidden_states == 0.), \
-                #         "encoder_hidden_states should be all zeros for naive SD"
-                # elif args.naive_conditional == 'conditional':
-                #     # check that the encoder_hidden_states are not all zeros
-                #     assert not torch.all(encoder_hidden_states == 0.), \
-                #         "encoder_hidden_states should not be all zeros for MorphoDiff"
-                # Let's keep the original logic for now, assuming 1.0 is the intended check value.
-                if args.naive_conditional == 'naive':
-                     # Check if the mean is close to 1.0, allowing for floating point inaccuracy
-                     is_all_ones = torch.allclose(encoder_hidden_states, torch.ones_like(encoder_hidden_states))
-                     assert is_all_ones, \
-                         f"encoder_hidden_states should be all ones for naive SD, but got mean {encoder_hidden_states.mean().item()}"
-                elif args.naive_conditional == 'conditional':
-                     # check that the encoder_hidden_states are not all ones
-                     is_all_ones = torch.allclose(encoder_hidden_states, torch.ones_like(encoder_hidden_states))
-                     assert not is_all_ones, \
-                         f"encoder_hidden_states should not be all ones for MorphoDiff, but they appear to be."
-                # --- End Conditional Check ---
-
-                # Get the target for loss depending on the prediction type
-                if args.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
-                    noise_scheduler.register_to_config(
-                        prediction_type=args.prediction_type)
-
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(
-                        latents, noise, timesteps)
+                    rna_reconstruction_loss = torch.tensor(0.0, device=outputs["image_pred"].device)
+                
+                # 计算KL散度损失
+                kl_div = -0.5 * torch.mean(1 + outputs["rna_latent_logvar"] - outputs["rna_latent_mu"].pow(2) - 
+                                         outputs["rna_latent_logvar"].exp())
+                
+                # 动态权重或固定权重计算最终损失
+                if args.use_dynamic_loss_scaling:
+                    # 计算各损失的不确定性权重
+                    image_weight = torch.exp(-log_image_weight)
+                    rna_weight = torch.exp(-log_rna_weight)
+                    kl_div_weight = torch.exp(-log_kl_weight) if not args.kl_annealing else torch.tensor(kl_weight, device=accelerator.device)
+                    
+                    # 使用不确定性权重计算总损失
+                    loss = image_weight * image_reconstruction_loss + log_image_weight
+                    loss = loss + rna_weight * rna_reconstruction_loss + log_rna_weight
+                    loss = loss + kl_div_weight * kl_div + log_kl_weight
+                    
+                    # 每个step记录权重值
+                    logger.info(f"当前动态权重：图像={image_weight.item():.4f}，RNA={rna_weight.item():.4f}，KL={kl_div_weight.item():.4f}")
                 else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                # Predict the noise residual and compute loss
-                model_pred = unet(
-                    noisy_latents, timesteps,
-                    encoder_hidden_states,
-                    return_dict=False)[0]
-
-                if args.snr_gamma is None:
-                    loss = F.mse_loss(
-                        model_pred.float(),
-                        target.float(),
-                        reduction="mean")
-                else:
-                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                    # This is discussed in Section 4.2 of the same paper.
-                    snr = compute_snr(noise_scheduler, timesteps)
-                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-                        dim=1
-                    )[0]
-                    if noise_scheduler.config.prediction_type == "epsilon":
-                        mse_loss_weights = mse_loss_weights / snr
-                    elif noise_scheduler.config.prediction_type == "v_prediction":
-                        mse_loss_weights = mse_loss_weights / (snr + 1)
-
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
-
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
-
-                # Backpropagate
+                    # 使用固定权重
+                    loss = args.image_loss_weight * image_reconstruction_loss + \
+                           args.rna_loss_weight * rna_reconstruction_loss + \
+                           kl_weight * kl_div
+                
+                train_image_loss += image_reconstruction_loss.detach().item()
+                train_rna_loss += rna_reconstruction_loss.detach().item()
+                train_kl_loss += kl_div.detach().item()
+                train_loss += loss.detach().item()
+                
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
-                if args.use_ema and ema_unet is not None: # Check if ema_unet exists
-                     # Pass unwrapped unet parameters to EMA
-                     # ema_unet.step(unet.parameters()) # Original
-                     # Pass parameters of the *accelerator-prepared* model
-                     # Need to unwrap first if using deepspeed/fsdp?
-                     # Let's assume accelerator handles unwrapping internally if needed for EMA step.
-                     # Check EMA documentation for use with Accelerate.
-                     # Usually, you step EMA with the *original* model's parameters.
-                     # Let's try passing the unwrapped model's parameters.
-                     ema_unet.step(accelerator.unwrap_model(unet).parameters()) 
+                if args.use_ema and ema_unet is not None:
+                     ema_unet.step(accelerator.unwrap_model(model).unet.parameters()) 
 
                 progress_bar.update(1)
                 global_step += 1
-                # Log training loss
-                accelerator.log({"train_loss": train_loss}, step=global_step) # Use global_step for logging
+                accelerator.log({
+                    "train_loss": train_loss,
+                    "train_image_loss": train_image_loss,
+                    "train_rna_loss": train_rna_loss,
+                    "train_kl_loss": train_kl_loss,
+                    "lr": lr_scheduler.get_last_lr()[0] if lr_scheduler is not None else 0
+                }, step=global_step)
                 
-                # Log learning rate
-                if lr_scheduler is not None:
-                     lr = lr_scheduler.get_last_lr()[0]
-                     accelerator.log({"lr": lr}, step=global_step)
-                     
-                train_loss = 0.0 # Reset accumulated loss
-                total_trained_steps = global_step + args.trained_steps # Calculate total steps including previous runs
-                # print('global_step:', global_step, 'total_trained_steps:', total_trained_steps) # Debug print
+                train_loss = 0.0
+                train_image_loss = 0.0
+                train_rna_loss = 0.0
+                train_kl_loss = 0.0
+                total_trained_steps = global_step + args.trained_steps
 
-                # --- Checkpointing Logic ---
-                # Check if checkpointing is due based on total_trained_steps and checkpointing_steps
-                # Also checkpoint at the very last step
                 should_checkpoint = (total_trained_steps % args.checkpointing_steps == 0) or \
                                     (global_step >= args.max_train_steps)
                 
                 if should_checkpoint:
                     if accelerator.is_main_process:
+                        logger.info(f"在总训练步骤{total_trained_steps}（全局步骤{global_step}）进行检查点")
                         logger.info(f"Checkpointing at total trained step {total_trained_steps} (global step {global_step})")
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
@@ -1347,146 +1469,123 @@ def main():
                                 logger.info(f"Removed state from {old_ckpt_path}")
                         save_path = os.path.join(
                             args.output_dir, f"checkpoint-{total_trained_steps}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved accelerator state to {save_path}")
+                        
+                        # 手动保存优化器状态
+                        os.makedirs(save_path, exist_ok=True)
+                        optimizer_path = os.path.join(save_path, "optimizer.bin")
+                        torch.save(optimizer.state_dict(), optimizer_path)
+                        logger.info(f"优化器状态已保存到 {optimizer_path}")
+                        
+                        # 保存学习率调度器
+                        lr_scheduler_path = os.path.join(save_path, "scheduler.bin")
+                        torch.save(lr_scheduler.state_dict(), lr_scheduler_path)
+                        logger.info(f"学习率调度器已保存到 {lr_scheduler_path}")
+                        
+                        # 保存随机状态
+                        rng_path = os.path.join(save_path, "rng_state.pth")
+                        rng_states = {
+                            "torch_rng_state": torch.get_rng_state(),
+                            "cuda_rng_state": torch.cuda.get_rng_state(),
+                            "numpy_rng_state": np.random.get_state(),
+                            "random_rng_state": random.getstate(),
+                        }
+                        torch.save(rng_states, rng_path)
+                        logger.info(f"随机状态已保存到 {rng_path}")
+                        
+                        logger.info(f"已完成模型状态保存到 {save_path}")
 
-                        # --- Save Model Components Manually for Pipeline ---
-                        logger.info("Saving model components for pipeline...")
-                        unet_ckpt = accelerator.unwrap_model(unet) # Unwrap the model
+                        logger.info("保存模型组件用于推理管道...")
+                        model_unwrapped = accelerator.unwrap_model(model)
+                        unet_ckpt = model_unwrapped.unet
 
-                        # Apply EMA weights to the unwrapped model if EMA is used
                         if args.use_ema and ema_unet is not None:
-                            logger.info("Applying EMA weights to saved model.")
-                            # Store current weights
-                            # current_state_dict = {k: v.clone() for k, v in unet_ckpt.state_dict().items()}
-                            ema_unet.copy_to(unet_ckpt.parameters()) 
-
-                        # Save UNet
+                            logger.info("将EMA权重应用到保存的模型。")
+                            ema_unet.copy_to(unet_ckpt.parameters())
+                        
+                        # 保存UNet
                         unet_save_path = os.path.join(save_path, "unet")
                         unet_ckpt.save_pretrained(unet_save_path)
-                        logger.info(f"Saved UNet model to {unet_save_path}")
+                        logger.info(f"UNet模型已保存到 {unet_save_path}")
                         
-                        # Restore original weights if EMA was applied temporarily for saving
-                        # if args.use_ema and ema_unet is not None:
-                        #    unet_ckpt.load_state_dict(current_state_dict)
-                        #    logger.info("Restored original model weights after EMA save.")
+                        # 保存RNA编码器和解码器
+                        rna_encoder_save_path = os.path.join(save_path, "rna_encoder")
+                        os.makedirs(rna_encoder_save_path, exist_ok=True)
+                        torch.save(model_unwrapped.rna_encoder.state_dict(), os.path.join(rna_encoder_save_path, "pytorch_model.bin"))
+                        logger.info(f"RNA编码器已保存到 {rna_encoder_save_path}")
+                        
+                        rna_decoder_save_path = os.path.join(save_path, "rna_decoder")
+                        os.makedirs(rna_decoder_save_path, exist_ok=True)
+                        torch.save(model_unwrapped.rna_decoder.state_dict(), os.path.join(rna_decoder_save_path, "pytorch_model.bin"))
+                        logger.info(f"RNA解码器已保存到 {rna_decoder_save_path}")
+                        
+                        # 保存RNA潜在投影层
+                        rna_latent_proj_save_path = os.path.join(save_path, "rna_latent_proj")
+                        os.makedirs(rna_latent_proj_save_path, exist_ok=True)
+                        torch.save(model_unwrapped.rna_latent_proj.state_dict(), os.path.join(rna_latent_proj_save_path, "pytorch_model.bin"))
+                        logger.info(f"RNA潜在投影层已保存到 {rna_latent_proj_save_path}")
 
-
-                        # Save Scheduler
+                        # 保存调度器
                         noise_scheduler.save_pretrained(os.path.join(save_path, "scheduler"))
-                        logger.info(f"Saved Scheduler config to {os.path.join(save_path, 'scheduler')}")
+                        logger.info(f"调度器配置已保存到 {os.path.join(save_path, 'scheduler')}")
 
-                        # Save VAE config (VAE is frozen, so no need to save weights unless fine-tuned)
-                        # We need the VAE config for the pipeline, but weights come from original path
+                        # 保存VAE配置（VAE是冻结的，除非微调，否则无需保存权重）
                         vae_config_save_path = os.path.join(save_path, "vae")
                         os.makedirs(vae_config_save_path, exist_ok=True)
-                        # Save VAE config - Assuming vae is the loaded AutoencoderKL instance
-                        # Need to unwrap VAE as well if prepared by accelerator? Usually frozen models aren't.
-                        # Let's assume vae is not wrapped or doesn't need unwrapping here.
                         try:
-                             # Save the config file
-                             vae.save_config(vae_config_save_path)
-                             logger.info(f"Saved VAE config to {vae_config_save_path}")
-                             # We might also need the feature extractor config if it's not standard
+                             # 保存配置文件
+                             model_unwrapped.vae.save_config(vae_config_save_path)
+                             logger.info(f"VAE配置已保存到 {vae_config_save_path}")
+                             # 可能还需要特征提取器配置
                              feature_extractor_save_path = os.path.join(save_path, "feature_extractor")
                              os.makedirs(feature_extractor_save_path, exist_ok=True)
-                             # Load feature extractor from original path to save its config
-                             # This assumes it's standard and loaded during validation - maybe load it once here?
                              try:
-                                 # Need to define feature_extractor earlier or pass path via args
-                                 # Let's load it from the VAE path as per validation logic
                                  feature_extractor_orig_path = os.path.join(args.pretrained_vae_path, 'feature_extractor')
                                  if os.path.isdir(feature_extractor_orig_path):
                                      feature_extractor = AutoFeatureExtractor.from_pretrained(feature_extractor_orig_path)
                                      feature_extractor.save_pretrained(feature_extractor_save_path)
-                                     logger.info(f"Saved Feature Extractor config to {feature_extractor_save_path}")
+                                     logger.info(f"特征提取器配置已保存到 {feature_extractor_save_path}")
                                  else:
-                                     logger.warning(f"Feature extractor directory not found at {feature_extractor_orig_path}, cannot save config.")
+                                     logger.warning(f"在 {feature_extractor_orig_path} 未找到特征提取器目录，无法保存配置。")
                              except Exception as e:
-                                 logger.error(f"Could not load or save feature extractor config: {e}")
-
+                                 logger.error(f"无法加载或保存特征提取器配置: {e}")
                         except Exception as e:
-                             logger.error(f"Error saving VAE/Feature Extractor config: {e}")
+                             logger.error(f"保存VAE/特征提取器配置时出错: {e}")
 
-
-                        # Save training arguments
+                        # 保存训练参数
                         try:
                             args_dict = vars(args)
-                            # Convert Path objects to strings for JSON serialization
+                            # 将Path对象转换为字符串以进行JSON序列化
                             for key, value in args_dict.items():
                                 if isinstance(value, Path):
                                     args_dict[key] = str(value)
                             
                             with open(os.path.join(save_path, 'training_args.json'), 'w') as f:
                                 json.dump(args_dict, f, indent=2)
-                            logger.info(f"Saved training arguments to {os.path.join(save_path, 'training_args.json')}")
+                            logger.info(f"训练参数已保存到 {os.path.join(save_path, 'training_args.json')}")
                         except Exception as e:
-                            logger.error(f"Failed to save training arguments: {e}")
+                            logger.error(f"保存训练参数失败: {e}")
 
-
-                        # --- Deprecated Pipeline Saving within checkpoint ---
-                        # pipeline = StableDiffusionPipeline(
-                        #     vae=accelerator.unwrap_model(vae), # Use unwrapped VAE
-                        #     text_encoder=None, # No text encoder in this setup
-                        #     tokenizer=None, # No tokenizer
-                        #     unet=unet_ckpt, # Use the potentially EMA-applied UNet
-                        #     scheduler=noise_scheduler, # Use the current noise scheduler
-                        #     feature_extractor=feature_extractor, # Need feature extractor instance
-                        #     safety_checker=None, # No safety checker
-                        # )
-                        # try:
-                        #     pipeline.save_pretrained(save_path)
-                        #     logger.info(f"Saved full pipeline to {save_path}")
-                        # except Exception as e:
-                        #     logger.error(f"Failed to save pipeline: {e}")
-                        # --- End Deprecated Pipeline Saving ---
-
-                        # # Run validation using the *saved checkpoint path*
-                        # if (args.validation_prompts is not None):
-                        #      # Check if validation should run at this step
-                        #      is_validation_step = (total_trained_steps % args.validation_epochs == 0) or \
-                        #                           (global_step >= args.max_train_steps)
-                             
-                        #      if is_validation_step:
-                        #          logger.info(f"Running validation at total trained step {total_trained_steps}.")
-                        #          try:
-                        #              # Pass the save_path (checkpoint directory) to log_validation
-                        #              log_validation(
-                        #                  args,
-                        #                  accelerator,
-                        #                  weight_dtype,
-                        #                  total_trained_steps, # Pass total steps for logging clarity
-                        #                  save_path # Pass the path to the saved checkpoint
-                        #              )
-                        #          except Exception as e:
-                        #              logger.error(f"Validation failed at step {total_trained_steps}: {e}")
-                            
-                        # write checkpoint info to the log file
+                        # 将检查点信息写入日志文件
                         try:
-                            # Ensure file exists and write header if needed (idempotent check)
+                            # 确保文件存在并在需要时写入标题（幂等检查）
                             if not os.path.exists(args.checkpointing_log_file):
                                 with open(args.checkpointing_log_file, "w") as f:
-                                     # Define header based on expected columns
+                                     # 根据预期列定义标题
                                      header = "dataset_id,log_dir,pretrained_model_dir,checkpoint_dir,seed,trained_steps,checkpoint_number\n"
                                      f.write(header)
-                                     logger.info(f"Created checkpoint log file: {args.checkpointing_log_file}")
+                                     logger.info(f"创建检查点日志文件: {args.checkpointing_log_file}")
 
                             with open(args.checkpointing_log_file, "a") as f:
-                                f.write(f"{args.dataset_id or 'N/A'},"
-                                        f"{args.logging_dir},"
-                                        f"{args.pretrained_model_name_or_path}," # Log the initial base model path
-                                        f"{save_path}," # Log the specific checkpoint path saved
-                                        f"{args.seed},"
-                                        f"{total_trained_steps}," # Log total steps reached at this checkpoint
-                                        f"{args.checkpoint_number or 'N/A'}\n") # Log the provided checkpoint number if any
-                                logger.info(f"Appended checkpoint info to {args.checkpointing_log_file}")
+                                f.write(f"{args.dataset_id or 'N/A'}")
+                                f.write(f"{args.logging_dir}")
+                                f.write(f"{args.pretrained_model_name_or_path}")
+                                f.write(f"{save_path}")
+                                f.write(f"{args.seed}")
+                                f.write(f"{total_trained_steps}")
+                                f.write(f"{args.checkpoint_number or 'N/A'}")
+                                logger.info(f"检查点信息已追加到 {args.checkpointing_log_file}")
                         except Exception as e:
-                             logger.error(f"Failed to write to checkpoint log file {args.checkpointing_log_file}: {e}")
-
-            # Log step loss and learning rate (already logged inside sync_gradients block)
-            # logs = {"step_loss": loss.detach().item(),
-            #         "lr": lr_scheduler.get_last_lr()[0]}
-            # progress_bar.set_postfix(**logs)
+                             logger.error(f"写入检查点日志文件 {args.checkpointing_log_file} 失败: {e}")
 
             # Check for termination based on total steps (moved from original code)
             if args.total_steps > 0 and total_trained_steps >= args.total_steps:
@@ -1505,9 +1604,6 @@ def main():
     # End Training
     logger.info("Training finished.")
     accelerator.wait_for_everyone() # Ensure all processes finish cleanly
-    
-    # Final Checkpointing and Validation (optional, could be redundant if last step checkpointed)
-    # Consider if a final save/validation outside the loop is needed
     
     # Clean up trackers
     accelerator.end_training()

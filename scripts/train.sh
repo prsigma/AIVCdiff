@@ -39,6 +39,17 @@ export PERTURB_ID_COL="compound" # h5ad中包含扰动ID的列名
 export IMAGE_ROOT_DIR=" " # <--- !!! 修改这里: 如果h5ad中的路径是相对此目录的, 否则留空 (" ") !!!
 # --- 结束修改 --- 
 
+# --- 添加: 控制 RNA h5ad 文件路径 ---
+export RNA_CTRL_H5AD_PATH="/home/pr/1_3_rna_ctrl_data.h5ad" # <--- !!! 修改这里: 指定你的对照组h5ad文件路径 !!!
+# --- 结束添加 ---
+
+# --- 添加: 新的必需参数 ---
+# 设置RNA维度（比如基因数量）
+export RNA_INPUT_DIM=977  # <--- !!! 修改这里: 根据你的RNA数据设置正确的维度 !!!
+# 设置扰动（药物）嵌入文件路径
+export PERTURBATION_EMBEDDING_PATH="/data/pr/molecule_embeddings_rdkit_BBBC021.csv"  # <--- !!! 修改这里: 指定你的药物嵌入文件路径 !!!
+# --- 结束添加 ---
+
 # 设置checkpoint日志文件
 export CKPT_LOG_FILE="${LOG_DIR}${EXPERIMENT}_checkpoints.csv"
 
@@ -84,6 +95,8 @@ echo "模型目录: $MODEL_NAME"
 echo "输出目录: $OUTPUT_DIR"
 echo "数据目录: $TRAIN_H5AD_PATH"
 echo "已训练步数: $TRAINED_STEPS"
+echo "RNA输入维度: $RNA_INPUT_DIM"
+echo "扰动嵌入路径: $PERTURBATION_EMBEDDING_PATH"
 
 export CUDA_VISIBLE_DEVICES=0,1
 unset LD_LIBRARY_PATH
@@ -99,6 +112,7 @@ accelerate launch --config_file /home/pr/.cache/huggingface/accelerate/default_c
   --image_root_dir="$IMAGE_ROOT_DIR" \
   --dataset_id=$EXPERIMENT \
   --enable_xformers_memory_efficient_attention \
+  --rna_ctrl_data_path=$RNA_CTRL_H5AD_PATH \
   --random_flip \
   --use_ema \
   --train_batch_size=32 \
@@ -119,8 +133,12 @@ accelerate launch --config_file /home/pr/.cache/huggingface/accelerate/default_c
   --trained_steps=$TRAINED_STEPS \
   --dataloader_num_workers=32 \
   --checkpointing_log_file=$CKPT_LOG_FILE \
-  --checkpoint_number=$CKPT_NUMBER
-
-# Removed old args: --train_data_dir=$TRAIN_DIR
-# Removed old args: --image_column="image"
-# Removed old args: --caption_column='perturb_id'
+  --checkpoint_number=$CKPT_NUMBER \
+  --rna_input_dim=$RNA_INPUT_DIM \
+  --perturbation_embedding_path=$PERTURBATION_EMBEDDING_PATH  \
+  --use_dynamic_loss_scaling \
+  --dynamic_weight_alpha=0.01 \
+  --kl_annealing \
+  --kl_annealing_steps=1000 \
+  --max_kl_weight=1.0 \
+  --loss_log_scale
